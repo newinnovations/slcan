@@ -1,0 +1,5 @@
+.venv
+.west
+deps
+zephyr-sdk-*
+build

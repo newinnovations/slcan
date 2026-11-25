@@ -1,0 +1,14 @@
+manifest:
+  remotes:
+    - name: zephyrproject-rtos
+      url-base: https://github.com/zephyrproject-rtos
+
+  projects:
+    - name: zephyr
+      remote: zephyrproject-rtos
+      revision: v4.4.2 # Pin to your preferred Zephyr release tag
+      import:
+        path-prefix: deps
+        name-allowlist:
+          - cmsis_6    # Needed for ARM Cortex-M chips
+          - hal_stm32  # Replace with your microcontroller's HAL
