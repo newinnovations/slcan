@@ -19,6 +19,18 @@ RING_BUF_DECLARE(uart_tx_rb, UART_TX_BUF_SIZE);
 /* Message queue for incoming CAN / CAN FD frames */
 CAN_MSGQ_DEFINE(can_rx_msgq, 32);
 
+/* LAWICEL status flags reported (and cleared) by the 'F' command */
+#define SLCAN_F_RX_QUEUE_FULL BIT(0) /* received CAN frame dropped before reaching host */
+#define SLCAN_F_TX_QUEUE_FULL BIT(1) /* no free CAN TX mailbox */
+#define SLCAN_F_ERROR_WARNING BIT(2)
+#define SLCAN_F_DATA_OVERRUN  BIT(3) /* serial input from host dropped */
+#define SLCAN_F_ERROR_PASSIVE BIT(5)
+#define SLCAN_F_ARB_LOST      BIT(6)
+#define SLCAN_F_BUS_ERROR     BIT(7)
+
+/* Latched flags, set from ISR and thread context */
+static atomic_t slcan_status;
+
 static bool can_is_open = false;
 static bool can_fd_enabled = false;
 static uint32_t current_bitrate = 500000;
@@ -57,28 +69,45 @@ static void uart_isr(const struct device *dev, void *user_data)
         if (uart_irq_rx_ready(dev)) {
             uint8_t buf[64];
             int len = uart_fifo_read(dev, buf, sizeof(buf));
-            if (len > 0) {
-                ring_buf_put(&uart_rx_rb, buf, len);
+            if (len > 0 && ring_buf_put(&uart_rx_rb, buf, len) < (uint32_t)len) {
+                atomic_or(&slcan_status, SLCAN_F_DATA_OVERRUN);
             }
         }
 
         if (uart_irq_tx_ready(dev)) {
-            uint8_t buf[64];
-            uint32_t len = ring_buf_get(&uart_tx_rb, buf, sizeof(buf));
+            uint8_t *data;
+            uint32_t len = ring_buf_get_claim(&uart_tx_rb, &data, UART_TX_BUF_SIZE);
+            int sent = 0;
             if (len > 0) {
-                int sent = uart_fifo_fill(dev, buf, len);
-                ARG_UNUSED(sent);
+                /* May accept fewer bytes than offered; the rest stays queued */
+                sent = uart_fifo_fill(dev, data, len);
             } else {
                 uart_irq_tx_disable(dev);
             }
+            ring_buf_get_finish(&uart_tx_rb, sent > 0 ? (uint32_t)sent : 0U);
         }
     }
 }
 
-static void uart_send_str(const char *str, size_t len)
+/* All-or-nothing so the host never receives a truncated SLCAN line */
+static bool uart_try_send(const char *str, size_t len)
 {
+    if (ring_buf_space_get(&uart_tx_rb) < len) {
+        return false;
+    }
     ring_buf_put(&uart_tx_rb, (const uint8_t *)str, len);
     uart_irq_tx_enable(uart_dev);
+    return true;
+}
+
+/* Command responses must not be lost: wait for the ISR to drain the buffer.
+ * A full buffer is non-empty, so the TX interrupt is enabled and draining.
+ */
+static void uart_send_str(const char *str, size_t len)
+{
+    while (!uart_try_send(str, len)) {
+        k_sleep(K_USEC(100));
+    }
 }
 
 static inline void slcan_ack(void)
@@ -117,6 +146,60 @@ static bool parse_hex_u32(const char *str, size_t digits, uint32_t *out)
     }
     *out = res;
     return true;
+}
+
+/* ---------------- CAN Callbacks ---------------- */
+
+static atomic_val_t can_state_flags(enum can_state state)
+{
+    switch (state) {
+    case CAN_STATE_ERROR_WARNING:
+        return SLCAN_F_ERROR_WARNING;
+    case CAN_STATE_ERROR_PASSIVE:
+        return SLCAN_F_ERROR_PASSIVE;
+    case CAN_STATE_BUS_OFF:
+        return SLCAN_F_BUS_ERROR;
+    default:
+        return 0;
+    }
+}
+
+static void can_state_cb(const struct device *dev, enum can_state state,
+             struct can_bus_err_cnt err_cnt, void *user_data)
+{
+    ARG_UNUSED(dev);
+    ARG_UNUSED(err_cnt);
+    ARG_UNUSED(user_data);
+
+    atomic_or(&slcan_status, can_state_flags(state));
+}
+
+static void can_rx_cb(const struct device *dev, struct can_frame *frame, void *user_data)
+{
+    ARG_UNUSED(dev);
+    ARG_UNUSED(user_data);
+
+    if (k_msgq_put(&can_rx_msgq, frame, K_NO_WAIT) != 0) {
+        atomic_or(&slcan_status, SLCAN_F_RX_QUEUE_FULL);
+    }
+}
+
+static void can_tx_cb(const struct device *dev, int error, void *user_data)
+{
+    ARG_UNUSED(dev);
+    ARG_UNUSED(user_data);
+
+    switch (error) {
+    case 0:
+    case -ENETDOWN: /* aborted by 'C' */
+        break;
+    case -EBUSY:
+        atomic_or(&slcan_status, SLCAN_F_ARB_LOST);
+        break;
+    default:
+        atomic_or(&slcan_status, SLCAN_F_BUS_ERROR);
+        break;
+    }
 }
 
 /* ---------------- SLCAN Command Parser ---------------- */
@@ -173,9 +256,16 @@ static void handle_tx_frame(const char *cmd, size_t len,
         }
     }
 
-    if (can_send(can_dev, &frame, K_MSEC(10), NULL, NULL) == 0) {
+    /* Asynchronous: a synchronous send blocks forever if no node ACKs the frame.
+     * ACK means the frame was queued in a TX mailbox; the outcome is reported via 'F'.
+     */
+    int err = can_send(can_dev, &frame, K_NO_WAIT, can_tx_cb, NULL);
+    if (err == 0) {
         slcan_ack();
     } else {
+        if (err == -EAGAIN) {
+            atomic_or(&slcan_status, SLCAN_F_TX_QUEUE_FULL);
+        }
         slcan_nack();
     }
 }
@@ -194,6 +284,7 @@ static void open_can_channel(can_mode_t base_mode)
 
     if (can_start(can_dev) == 0) {
         can_is_open = true;
+        atomic_clear(&slcan_status);
         slcan_ack();
     } else {
         slcan_nack();
@@ -304,8 +395,20 @@ static void process_slcan_command(const char *cmd, size_t len)
         uart_send_str("NC092\r", 6);
         break;
 
-    case 'F': /* Read status flags */
-        uart_send_str("F00\r", 4);
+    case 'F': /* Read and clear status flags (channel must be open) */
+        if (!can_is_open || len != 1) {
+            slcan_nack();
+        } else {
+            enum can_state state;
+            atomic_val_t flags = atomic_clear(&slcan_status);
+            if (can_get_state(can_dev, &state, NULL) == 0) {
+                flags |= can_state_flags(state);
+            }
+            const char resp[4] = {
+                'F', val_to_hex_char((uint8_t)(flags >> 4)), val_to_hex_char((uint8_t)flags), '\r'
+            };
+            uart_send_str(resp, sizeof(resp));
+        }
         break;
 
     case 'Z': /* Timestamp toggle (stubbed ACK) */
@@ -370,7 +473,10 @@ static void format_and_send_can_frame(const struct can_frame *frame)
     }
 
     out[pos++] = '\r';
-    uart_send_str(out, pos);
+    /* Drop whole frames when the serial link cannot keep up with the bus */
+    if (!uart_try_send(out, pos)) {
+        atomic_or(&slcan_status, SLCAN_F_RX_QUEUE_FULL);
+    }
 }
 
 /* ---------------- Main Entry ---------------- */
@@ -396,8 +502,11 @@ int main(void)
         .flags = CAN_FILTER_IDE
     };
 
-    can_add_rx_filter_msgq(can_dev, &can_rx_msgq, &std_filter);
-    can_add_rx_filter_msgq(can_dev, &can_rx_msgq, &ext_filter);
+    if (can_add_rx_filter(can_dev, can_rx_cb, NULL, &std_filter) < 0 ||
+        can_add_rx_filter(can_dev, can_rx_cb, NULL, &ext_filter) < 0) {
+        return -1;
+    }
+    can_set_state_change_callback(can_dev, can_state_cb, NULL);
 
     /* Set default nominal (500 kbps) and data (2 Mbps) bitrates */
     can_set_bitrate(can_dev, current_bitrate);
