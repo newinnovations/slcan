@@ -113,8 +113,22 @@ At 1 Mbaud the serial link carries about 100 kB/s. A busy bus produces more than
 11. Frame commands accepted trailing characters and out-of-range IDs. The length must now match the DLC exactly, and IDs must fit 11/29 bits.
 12. `\r\n` from the host produced two ACKs. The `\n` of a CRLF pair is now ignored.
 13. The overlay's redundant `&fdcan1 { status = "okay"; }` was removed; the board DTS already enables `fdcan1`.
+14. The main stack was ~98% full on the transmit path with no overflow detection. The large buffers are now `static` and the MPU stack guard is enabled (see below).
 
 ### Open concerns
 
-- `CONFIG_MAIN_STACK_SIZE=1024` is tight with `cmd_buf[256]`, a `struct can_rx_item` (CAN FD frame plus timestamp) and the 144-byte formatter buffer on the stack. This was not measured.
 - Whether the ST-LINK virtual COM port handles 1 Mbaud has not been checked on hardware.
+
+### Stack usage
+
+Per-function frame sizes come from a `-fstack-usage` build. Calls through driver function pointers (e.g. `api->send`) were followed by hand.
+
+| Worst path (transmit command)                                        | Before      | After      |
+| -------------------------------------------------------------------- | ----------- | ---------- |
+| `z_thread_entry` + `bg_thread_main`                                  | 72 B        | 72 B       |
+| `main` (command parser and formatter inlined)                        | 600 B       | 208 B      |
+| `handle_tx_frame` → `can_send` → `can_mcan_send` → message RAM write | ~304 B      | ~304 B     |
+| Exception frame when an interrupt arrives                            | 32 B        | 32 B       |
+| **Total of `CONFIG_MAIN_STACK_SIZE=1024`**                           | **~1008 B** | **~616 B** |
+
+`cmd_buf[256]` and the 144-byte formatter buffer are now `static`; only the main thread uses them. `CONFIG_ARM_MPU` and `CONFIG_HW_STACK_PROTECTION` put an MPU guard below each thread stack, so an overflow raises a fault instead of corrupting RAM. Together, the two changes raise RAM use from 13.4 KB to 15.0 KB (of 30 KB) and flash from 25.1 KB to 26.0 KB.

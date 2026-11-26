@@ -443,8 +443,10 @@ static void process_slcan_command(const char *cmd, size_t len)
 
 static void format_and_send_can_frame(const struct can_rx_item *item)
 {
-    /* Max size: 'B' (1) + ID (8) + DLC (1) + 64 bytes hex (128) + timestamp (4) + '\r' (1) = 143 bytes */
-    char out[144];
+    /* Max size: 'B' (1) + ID (8) + DLC (1) + 64 bytes hex (128) + timestamp (4) + '\r' (1) = 143 bytes.
+     * Static to keep it off the 1 KB main stack; only the main thread calls this.
+     */
+    static char out[144];
     size_t pos = 0;
     const struct can_frame *frame = &item->frame;
 
@@ -538,7 +540,8 @@ int main(void)
         return -1;
     }
 
-    char cmd_buf[256];
+    /* Static to keep it off the 1 KB main stack */
+    static char cmd_buf[256];
     size_t cmd_len = 0;
     bool cmd_overflow = false; /* discarding the rest of an over-long line */
     bool last_was_cr = false;
