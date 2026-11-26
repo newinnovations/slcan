@@ -16,8 +16,18 @@ static const struct device *const uart_dev = DEVICE_DT_GET(DT_CHOSEN(zephyr_cons
 RING_BUF_DECLARE(uart_rx_rb, UART_RX_BUF_SIZE);
 RING_BUF_DECLARE(uart_tx_rb, UART_TX_BUF_SIZE);
 
-/* Message queue for incoming CAN / CAN FD frames */
-CAN_MSGQ_DEFINE(can_rx_msgq, 32);
+/* Given by the UART ISR whenever bytes land in uart_rx_rb */
+K_SEM_DEFINE(uart_rx_sem, 0, 1);
+
+/* LAWICEL timestamps count milliseconds and wrap at 60000 (0xEA60) */
+#define SLCAN_TIMESTAMP_WRAP_MS 60000
+
+/* Received CAN / CAN FD frame with its arrival time */
+struct can_rx_item {
+    struct can_frame frame;
+    uint16_t timestamp; /* ms, 0..SLCAN_TIMESTAMP_WRAP_MS-1 */
+};
+K_MSGQ_DEFINE(can_rx_msgq, sizeof(struct can_rx_item), 32, 4);
 
 /* LAWICEL status flags reported (and cleared) by the 'F' command */
 #define SLCAN_F_RX_QUEUE_FULL BIT(0) /* received CAN frame dropped before reaching host */
@@ -31,10 +41,11 @@ CAN_MSGQ_DEFINE(can_rx_msgq, 32);
 /* Latched flags, set from ISR and thread context */
 static atomic_t slcan_status;
 
+#define DEFAULT_BITRATE      500000
+#define DEFAULT_DATA_BITRATE 2000000
+
 static bool can_is_open = false;
-static bool can_fd_enabled = false;
-static uint32_t current_bitrate = 500000;
-static uint32_t current_data_bitrate = 2000000;
+static bool timestamps_enabled = false;
 
 /* Standard LAWICEL nominal bitrates (S0 - S8) */
 static const uint32_t slcan_bitrates[] = {
@@ -69,8 +80,11 @@ static void uart_isr(const struct device *dev, void *user_data)
         if (uart_irq_rx_ready(dev)) {
             uint8_t buf[64];
             int len = uart_fifo_read(dev, buf, sizeof(buf));
-            if (len > 0 && ring_buf_put(&uart_rx_rb, buf, len) < (uint32_t)len) {
-                atomic_or(&slcan_status, SLCAN_F_DATA_OVERRUN);
+            if (len > 0) {
+                if (ring_buf_put(&uart_rx_rb, buf, len) < (uint32_t)len) {
+                    atomic_or(&slcan_status, SLCAN_F_DATA_OVERRUN);
+                }
+                k_sem_give(&uart_rx_sem);
             }
         }
 
@@ -179,7 +193,12 @@ static void can_rx_cb(const struct device *dev, struct can_frame *frame, void *u
     ARG_UNUSED(dev);
     ARG_UNUSED(user_data);
 
-    if (k_msgq_put(&can_rx_msgq, frame, K_NO_WAIT) != 0) {
+    struct can_rx_item item = {
+        .frame = *frame,
+        .timestamp = (uint16_t)(k_uptime_get() % SLCAN_TIMESTAMP_WRAP_MS),
+    };
+
+    if (k_msgq_put(&can_rx_msgq, &item, K_NO_WAIT) != 0) {
         atomic_or(&slcan_status, SLCAN_F_RX_QUEUE_FULL);
     }
 }
@@ -219,7 +238,8 @@ static void handle_tx_frame(const char *cmd, size_t len,
     }
 
     uint32_t id = 0;
-    if (!parse_hex_u32(&cmd[1], id_digits, &id)) {
+    if (!parse_hex_u32(&cmd[1], id_digits, &id) ||
+        id > (is_ext ? CAN_EXT_ID_MASK : CAN_STD_ID_MASK)) {
         slcan_nack();
         return;
     }
@@ -232,6 +252,13 @@ static void handle_tx_frame(const char *cmd, size_t len,
 
     uint8_t data_len = can_dlc_to_bytes((uint8_t)dlc);
 
+    /* Exact length: RTR frames carry no data, nothing may trail the data */
+    size_t expected_len = 1 + id_digits + 1 + (is_rtr ? 0 : (data_len * 2));
+    if (len != expected_len) {
+        slcan_nack();
+        return;
+    }
+
     struct can_frame frame = {0};
     frame.id = id;
     frame.dlc = (uint8_t)dlc;
@@ -241,11 +268,6 @@ static void handle_tx_frame(const char *cmd, size_t len,
     if (is_brs) frame.flags |= CAN_FRAME_BRS;
 
     if (!is_rtr) {
-        size_t expected_len = 1 + id_digits + 1 + (data_len * 2);
-        if (len < expected_len) {
-            slcan_nack();
-            return;
-        }
         for (uint8_t i = 0; i < data_len; i++) {
             uint32_t byte_val = 0;
             if (!parse_hex_u32(&cmd[1 + id_digits + 1 + (i * 2)], 2, &byte_val)) {
@@ -272,12 +294,10 @@ static void handle_tx_frame(const char *cmd, size_t len,
 
 static void open_can_channel(can_mode_t base_mode)
 {
-    can_mode_t mode = base_mode;
-    if (can_fd_enabled) {
-        mode |= CAN_MODE_FD;
-    }
-
-    if (can_set_mode(can_dev, mode) != 0) {
+    /* Always FD-capable: Classic CAN frames are unaffected, and 'd'/'D'/'b'/'B'
+     * work without a prior 'Y' (data phase defaults to DEFAULT_DATA_BITRATE).
+     */
+    if (can_set_mode(can_dev, base_mode | CAN_MODE_FD) != 0) {
         slcan_nack();
         return;
     }
@@ -302,27 +322,20 @@ static void process_slcan_command(const char *cmd, size_t len)
     case 'S': /* Set nominal bitrate S0..S8 */
         if (can_is_open || len != 2 || cmd[1] < '0' || cmd[1] > '8') {
             slcan_nack();
+        } else if (can_set_bitrate(can_dev, slcan_bitrates[cmd[1] - '0']) == 0) {
+            slcan_ack();
         } else {
-            current_bitrate = slcan_bitrates[cmd[1] - '0'];
-            if (can_set_bitrate(can_dev, current_bitrate) == 0) {
-                slcan_ack();
-            } else {
-                slcan_nack();
-            }
+            slcan_nack();
         }
         break;
 
     case 'Y': /* Set CAN FD data phase bitrate Y0..Y5 */
         if (can_is_open || len != 2 || cmd[1] < '0' || cmd[1] > '5') {
             slcan_nack();
+        } else if (can_set_bitrate_data(can_dev, slcan_data_bitrates[cmd[1] - '0']) == 0) {
+            slcan_ack();
         } else {
-            current_data_bitrate = slcan_data_bitrates[cmd[1] - '0'];
-            if (can_set_bitrate_data(can_dev, current_data_bitrate) == 0) {
-                can_fd_enabled = true;
-                slcan_ack();
-            } else {
-                slcan_nack();
-            }
+            slcan_nack();
         }
         break;
 
@@ -411,8 +424,13 @@ static void process_slcan_command(const char *cmd, size_t len)
         }
         break;
 
-    case 'Z': /* Timestamp toggle (stubbed ACK) */
-        slcan_ack();
+    case 'Z': /* Timestamps on received frames: Z0 off, Z1 on (channel must be closed) */
+        if (can_is_open || len != 2 || (cmd[1] != '0' && cmd[1] != '1')) {
+            slcan_nack();
+        } else {
+            timestamps_enabled = (cmd[1] == '1');
+            slcan_ack();
+        }
         break;
 
     default:
@@ -423,11 +441,12 @@ static void process_slcan_command(const char *cmd, size_t len)
 
 /* ---------------- CAN RX Formatter ---------------- */
 
-static void format_and_send_can_frame(const struct can_frame *frame)
+static void format_and_send_can_frame(const struct can_rx_item *item)
 {
-    /* Max size: 'B' (1) + ID (8) + DLC (1) + 64 bytes hex (128) + '\r' (1) = 139 bytes */
+    /* Max size: 'B' (1) + ID (8) + DLC (1) + 64 bytes hex (128) + timestamp (4) + '\r' (1) = 143 bytes */
     char out[144];
     size_t pos = 0;
+    const struct can_frame *frame = &item->frame;
 
     bool is_ext = (frame->flags & CAN_FRAME_IDE) != 0;
     bool is_rtr = (frame->flags & CAN_FRAME_RTR) != 0;
@@ -472,6 +491,12 @@ static void format_and_send_can_frame(const struct can_frame *frame)
         }
     }
 
+    if (timestamps_enabled) {
+        for (int i = 3; i >= 0; i--) {
+            out[pos++] = val_to_hex_char((item->timestamp >> (i * 4)) & 0x0F);
+        }
+    }
+
     out[pos++] = '\r';
     /* Drop whole frames when the serial link cannot keep up with the bus */
     if (!uart_try_send(out, pos)) {
@@ -508,41 +533,66 @@ int main(void)
     }
     can_set_state_change_callback(can_dev, can_state_cb, NULL);
 
-    /* Set default nominal (500 kbps) and data (2 Mbps) bitrates */
-    can_set_bitrate(can_dev, current_bitrate);
-    can_set_bitrate_data(can_dev, current_data_bitrate);
+    if (can_set_bitrate(can_dev, DEFAULT_BITRATE) != 0 ||
+        can_set_bitrate_data(can_dev, DEFAULT_DATA_BITRATE) != 0) {
+        return -1;
+    }
 
     char cmd_buf[256];
     size_t cmd_len = 0;
-    struct can_frame rx_frame;
+    bool cmd_overflow = false; /* discarding the rest of an over-long line */
+    bool last_was_cr = false;
+    struct can_rx_item rx_item;
+
+    struct k_poll_event events[] = {
+        K_POLL_EVENT_INITIALIZER(K_POLL_TYPE_SEM_AVAILABLE,
+                     K_POLL_MODE_NOTIFY_ONLY, &uart_rx_sem),
+        K_POLL_EVENT_INITIALIZER(K_POLL_TYPE_MSGQ_DATA_AVAILABLE,
+                     K_POLL_MODE_NOTIFY_ONLY, &can_rx_msgq),
+    };
 
     while (1) {
+        k_poll(events, ARRAY_SIZE(events), K_FOREVER);
+        for (size_t i = 0; i < ARRAY_SIZE(events); i++) {
+            events[i].state = K_POLL_STATE_NOT_READY;
+        }
+        /* Take before draining: a give racing with the drain re-arms the next poll */
+        k_sem_take(&uart_rx_sem, K_NO_WAIT);
 
         /* 1. Drain incoming UART bytes and assemble '\r'-terminated SLCAN commands */
         uint8_t c;
         while (ring_buf_get(&uart_rx_rb, &c, 1) == 1) {
+            if (c == '\n' && last_was_cr) {
+                /* CRLF: the CR already terminated the command */
+                last_was_cr = false;
+                continue;
+            }
+            last_was_cr = (c == '\r');
+
             if (c == '\r' || c == '\n') {
-                cmd_buf[cmd_len] = '\0';
-                process_slcan_command(cmd_buf, cmd_len);
+                if (cmd_overflow) {
+                    cmd_overflow = false; /* already NACKed */
+                } else {
+                    process_slcan_command(cmd_buf, cmd_len);
+                }
                 cmd_len = 0;
-            } else if (cmd_len < (sizeof(cmd_buf) - 1)) {
+            } else if (cmd_overflow) {
+                /* Discard until the end of the line */
+            } else if (cmd_len < sizeof(cmd_buf)) {
                 cmd_buf[cmd_len++] = (char)c;
             } else {
+                cmd_overflow = true;
                 cmd_len = 0;
                 slcan_nack();
             }
         }
 
         /* 2. Forward any received CAN frames to UART */
-        while (k_msgq_get(&can_rx_msgq, &rx_frame, K_NO_WAIT) == 0) {
+        while (k_msgq_get(&can_rx_msgq, &rx_item, K_NO_WAIT) == 0) {
             if (can_is_open) {
-                format_and_send_can_frame(&rx_frame);
+                format_and_send_can_frame(&rx_item);
             }
-
         }
-
-        /* Yield briefly to avoid burning 100% CPU while idle */
-        k_sleep(K_USEC(100));
     }
     return 0;
 }

@@ -80,6 +80,18 @@ To remove the generated local environment, workspace, build output, SDK, and the
 
 `\r` after a transmit command means the frame was queued in a CAN TX mailbox, not that it was sent. Transmit failures show up in `F` bit 7. If no node ACKs the frames, the mailboxes stay full and later transmit commands are answered with BEL and set bit 1.
 
+### CAN FD
+
+`O` and `L` always open the controller in CAN FD mode. Classic CAN frames are sent and received unchanged, and `d`/`D`/`b`/`B` work without a prior `Y`. The data phase defaults to 2 Mbit/s (nominal: 500 kbit/s); `Y0`-`Y5` change it while the channel is closed. The on-board MCP2562FD transceiver is rated up to 5 Mbit/s.
+
+### Timestamps (`Z`)
+
+`Z1` turns timestamps on and `Z0` turns them off; both work only while the channel is closed. With timestamps on, every received frame carries four extra hex digits before the `\r`: the arrival time in milliseconds, wrapping at 60000 (`0000`-`EA5F`).
+
+### Command parsing
+
+Commands end with `\r`; a bare `\n` also ends a command, and the `\n` of a `\r\n` pair is ignored. A frame command must have exactly the length its DLC implies (no data for `r`/`R`), and its ID must fit 11 or 29 bits. A line longer than 256 characters gets one BEL, and the rest of it is discarded.
+
 ### Serial throughput
 
 At 1 Mbaud the serial link carries about 100 kB/s. A busy bus produces more than that, for example ~198 kB/s for classic 8-byte frames at 1 Mbit/s, or ~460 kB/s for 64-byte CAN FD frames at a 2 Mbit/s data rate. The firmware then drops whole received frames (never partial lines) and sets `F` bit 0.
@@ -93,16 +105,16 @@ At 1 Mbaud the serial link carries about 100 kB/s. A busy bus produces more than
 3. A full serial TX buffer truncated SLCAN lines mid-frame. Received frames are now dropped whole. Command responses wait for buffer space.
 4. `CONFIG_CAN_ACCEPT_RTR` was unset, so the driver rejected every incoming RTR frame. It is now enabled in `prj.conf`.
 5. `F` always returned `F00`. It now reports real flags (see above).
+6. `Z` was ACKed without adding timestamps. `Z1`/`Z0` now turn millisecond timestamps on and off (see above).
+7. The main loop woke every 100 µs. It now sleeps in `k_poll` on the CAN RX message queue and a semaphore given by the UART RX interrupt.
+8. FD mode was enabled only after `Y` and could not be disabled again. The channel now always opens FD-capable, so `d`/`D`/`b`/`B` work without `Y`.
+9. Results of the startup bitrate calls were ignored; the firmware now stops if they fail. `S`/`Y` no longer change state when the bitrate is rejected.
+10. After a command line overflowed the 256-byte buffer, the rest of the line was parsed as a new command. It is now discarded up to the end of the line.
+11. Frame commands accepted trailing characters and out-of-range IDs. The length must now match the DLC exactly, and IDs must fit 11/29 bits.
+12. `\r\n` from the host produced two ACKs. The `\n` of a CRLF pair is now ignored.
+13. The overlay's redundant `&fdcan1 { status = "okay"; }` was removed; the board DTS already enables `fdcan1`.
 
 ### Open concerns
 
-- `Z` (timestamps) is ACKed, but no timestamps are added. A host that enables timestamps will misparse every received frame.
-- The main loop polls every 100 µs (`k_sleep(K_USEC(100))`). Waiting with `k_poll` on the CAN message queue and a semaphore given by the UART ISR would avoid the constant wakeups.
-- `Y` enables CAN FD mode permanently; nothing disables it again. Without `Y`, `d`/`D`/`b`/`B` are rejected (`-ENOTSUP`).
-- The results of the startup `can_set_bitrate()`/`can_set_bitrate_data()` calls are ignored. `S` updates `current_bitrate` before the bitrate change succeeds.
-- After a command line overflows the 256-byte buffer, the rest of the line is parsed as a new command instead of being discarded up to the next `\r`.
-- Frame commands accept trailing junk (`len < expected_len` instead of `!=`). IDs beyond 11/29 bits are rejected only by `can_send()` (`-EINVAL`).
-- A host that sends `\r\n` gets two ACKs, because the `\n` counts as an empty command.
-- `CONFIG_MAIN_STACK_SIZE=1024` is tight with `cmd_buf[256]`, a CAN FD `struct can_frame` and the 144-byte formatter buffer on the stack. This was not measured.
-- The `&fdcan1 { status = "okay"; }` overlay entry is redundant; the board DTS already enables `fdcan1` and its MCP2562FD transceiver (max 5 Mbit/s).
+- `CONFIG_MAIN_STACK_SIZE=1024` is tight with `cmd_buf[256]`, a `struct can_rx_item` (CAN FD frame plus timestamp) and the 144-byte formatter buffer on the stack. This was not measured.
 - Whether the ST-LINK virtual COM port handles 1 Mbaud has not been checked on hardware.

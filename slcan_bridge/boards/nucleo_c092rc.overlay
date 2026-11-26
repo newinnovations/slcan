@@ -2,7 +2,3 @@
 &usart2 {
 	current-speed = <1000000>;
 };
-
-&fdcan1 {
-	status = "okay";
-};
