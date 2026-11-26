@@ -1,10 +1,18 @@
-# Zephyr project setup
+# SLCAN Bridge
 
-## Requirements
+This repository contains the Zephyr-based SLCAN bridge project for the Nucleo C092RC board.
+
+## Overview
+
+The SLCAN bridge project enables communication between a host system and CAN networks using the Nucleo C092RC board. It implements the SLCAN protocol over UART and supports both Classic CAN and CAN FD frames. The bridge is built on the Zephyr RTOS, leveraging its device drivers and message queue mechanisms for efficient CAN frame handling.
+
+## Zephyr project setup
+
+### Requirements
 
 Run this setup on Linux with a supported host architecture: `x86_64` or `aarch64`. The setup script requires Bash, `uv`, Git, CMake (3.20 or newer), and Ninja, plus internet access. Device tree compiler and other host tools come from the Zephyr SDK.
 
-## Install
+### Install
 
 From the repository root, run:
 
@@ -29,22 +37,22 @@ Files created in this repository directory:
 deps/zephyr/              Zephyr
 deps/modules/             Modules imported from Zephyr's manifest
 zephyr-sdk-<version>/     Zephyr SDK
-build/                    Build output of make-sample.sh
+build/                    Build output of make.sh
 ```
 
 Outside it, the SDK's `setup.sh` registers the SDK in the CMake user package registry under `~/.cmake/packages/Zephyr-sdk/`.
 
-## Build
+### Build
 
-To build the configured sample after installation, run:
+To build the configured project after installation, run:
 
 ```sh
-./make-sample.sh
+./make.sh
 ```
 
 It sets `ZEPHYR_SDK_INSTALL_DIR` so the build prefers the SDK in this directory over any other registered one.
 
-## Clean
+### Clean
 
 To remove the generated local environment, workspace, build output, SDK, and the SDK's CMake package registry entry, run:
 
