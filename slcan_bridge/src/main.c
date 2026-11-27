@@ -16,7 +16,7 @@ static const struct device *const uart_dev = DEVICE_DT_GET(DT_CHOSEN(zephyr_cons
 RING_BUF_DECLARE(uart_rx_rb, UART_RX_BUF_SIZE);
 RING_BUF_DECLARE(uart_tx_rb, UART_TX_BUF_SIZE);
 
-/* Given by the UART ISR whenever bytes land in uart_rx_rb */
+/* Given by the UART callback whenever bytes land in uart_rx_rb */
 K_SEM_DEFINE(uart_rx_sem, 0, 1);
 
 /* LAWICEL timestamps count milliseconds and wrap at 60000 (0xEA60) */
@@ -67,55 +67,84 @@ static const uint32_t slcan_data_bitrates[] = {
     2000000, /* Y2: 2 Mbit/s */
     3000000, /* Y3: 3 Mbit/s */
     4000000, /* Y4: 4 Mbit/s */
-    5000000  /* Y5: 5 Mbit/s */
+    5000000  /* Y5: 5 Mbit/s, always rejected: 48 MHz FDCAN clock / 5 Mbit/s = 9.6 tq */
 };
 
-/* ---------------- UART Helpers & ISR ---------------- */
+/* ---------------- UART (async API, DMA) ---------------- */
 
-static void uart_isr(const struct device *dev, void *user_data)
+/* USART2 has no RX FIFO, so at 1 Mbaud an RX interrupt held off for more than
+ * one byte time (10 us) loses bytes. The DMA writes into this circular buffer
+ * regardless of interrupt latency; the driver reports new data from the DMA
+ * half/full interrupts and the USART idle-line interrupt.
+ */
+static uint8_t uart_rx_dma_buf[256];
+
+/* Set while a DMA transmission from uart_tx_rb runs; guarded by irq_lock() */
+static bool uart_tx_busy;
+
+/* Start a DMA transmission of the next contiguous part of uart_tx_rb.
+ * Called with interrupts locked or from the UART callback (ISR context).
+ */
+static void uart_tx_start(void)
 {
+    uint8_t *data;
+    uint32_t len = ring_buf_get_claim(&uart_tx_rb, &data, UART_TX_BUF_SIZE);
+
+    uart_tx_busy = len > 0 && uart_tx(uart_dev, data, len, SYS_FOREVER_US) == 0;
+    if (!uart_tx_busy) {
+        /* Nothing claimed for transmission; the data stays queued */
+        ring_buf_get_finish(&uart_tx_rb, 0);
+    }
+}
+
+static void uart_cb(const struct device *dev, struct uart_event *evt, void *user_data)
+{
+    ARG_UNUSED(dev);
     ARG_UNUSED(user_data);
 
-    while (uart_irq_update(dev) && uart_irq_is_pending(dev)) {
-        if (uart_irq_rx_ready(dev)) {
-            uint8_t buf[64];
-            int len = uart_fifo_read(dev, buf, sizeof(buf));
-            if (len > 0) {
-                if (ring_buf_put(&uart_rx_rb, buf, len) < (uint32_t)len) {
-                    atomic_or(&slcan_status, SLCAN_F_DATA_OVERRUN);
-                }
-                k_sem_give(&uart_rx_sem);
-            }
+    switch (evt->type) {
+    case UART_RX_RDY:
+        if (ring_buf_put(&uart_rx_rb, evt->data.rx.buf + evt->data.rx.offset,
+                 evt->data.rx.len) < evt->data.rx.len) {
+            atomic_or(&slcan_status, SLCAN_F_DATA_OVERRUN);
         }
+        k_sem_give(&uart_rx_sem);
+        break;
 
-        if (uart_irq_tx_ready(dev)) {
-            uint8_t *data;
-            uint32_t len = ring_buf_get_claim(&uart_tx_rb, &data, UART_TX_BUF_SIZE);
-            int sent = 0;
-            if (len > 0) {
-                /* May accept fewer bytes than offered; the rest stays queued */
-                sent = uart_fifo_fill(dev, data, len);
-            } else {
-                uart_irq_tx_disable(dev);
-            }
-            ring_buf_get_finish(&uart_tx_rb, sent > 0 ? (uint32_t)sent : 0U);
-        }
+    case UART_RX_STOPPED: /* DMA transfer error */
+        atomic_or(&slcan_status, SLCAN_F_DATA_OVERRUN);
+        break;
+
+    case UART_TX_DONE:
+    case UART_TX_ABORTED:
+        ring_buf_get_finish(&uart_tx_rb, evt->data.tx.len);
+        uart_tx_start();
+        break;
+
+    default:
+        /* UART_RX_BUF_REQUEST: the circular buffer needs no second buffer */
+        break;
     }
 }
 
 /* All-or-nothing so the host never receives a truncated SLCAN line */
 static bool uart_try_send(const char *str, size_t len)
 {
-    if (ring_buf_space_get(&uart_tx_rb) < len) {
-        return false;
+    unsigned int key = irq_lock();
+    bool queued = ring_buf_space_get(&uart_tx_rb) >= len;
+
+    if (queued) {
+        ring_buf_put(&uart_tx_rb, (const uint8_t *)str, len);
+        if (!uart_tx_busy) {
+            uart_tx_start();
+        }
     }
-    ring_buf_put(&uart_tx_rb, (const uint8_t *)str, len);
-    uart_irq_tx_enable(uart_dev);
-    return true;
+    irq_unlock(key);
+    return queued;
 }
 
-/* Command responses must not be lost: wait for the ISR to drain the buffer.
- * A full buffer is non-empty, so the TX interrupt is enabled and draining.
+/* Command responses must not be lost: wait for the DMA to drain the buffer.
+ * A full buffer is non-empty, so a transmission is running and draining it.
  */
 static void uart_send_str(const char *str, size_t len)
 {
@@ -514,8 +543,10 @@ int main(void)
         return -1;
     }
 
-    uart_irq_callback_user_data_set(uart_dev, uart_isr, NULL);
-    uart_irq_rx_enable(uart_dev);
+    if (uart_callback_set(uart_dev, uart_cb, NULL) != 0 ||
+        uart_rx_enable(uart_dev, uart_rx_dma_buf, sizeof(uart_rx_dma_buf), 0) != 0) {
+        return -1;
+    }
 
     /* Accept all standard and extended Classic CAN + CAN FD frames */
     const struct can_filter std_filter = {

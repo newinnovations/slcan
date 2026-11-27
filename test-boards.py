@@ -47,7 +47,8 @@ F_TX_FULL = 0x02
 F_ERROR_PASSIVE = 0x20
 
 BITRATES = ("10k", "20k", "50k", "100k", "125k", "250k", "500k", "800k", "1M")
-DATA_BITRATES = ("500k", "1M", "2M", "3M", "4M", "5M")
+# Y5 (5 Mbit/s) is not reachable from the 48 MHz FDCAN clock and is rejected
+DATA_BITRATES = ("500k", "1M", "2M", "3M", "4M")
 
 
 class TestFailure(Exception):
@@ -138,6 +139,8 @@ class SlcanPort:
         self.responses: queue.Queue[str] = queue.Queue()
         self.frames: queue.Queue[Frame | str] = queue.Queue()  # str: malformed line
         self.read_error: Exception | None = None
+        self.rx_bytes = 0  # total bytes received, for diagnosing a silent board
+        self._line = bytearray()  # bytes since the last '\r'
         self._stop = threading.Event()
         self._reader = threading.Thread(target=self._read_loop, name=f"{name}-rx", daemon=True)
         self._reader.start()
@@ -147,13 +150,14 @@ class SlcanPort:
             print(f"    {time.monotonic():.4f} {self.name} {arrow} {text!r}")
 
     def _read_loop(self) -> None:
-        line = bytearray()
+        line = self._line
         while not self._stop.is_set():
             try:
                 chunk = self.ser.read(self.ser.in_waiting or 1)
             except (serial.SerialException, OSError) as e:
                 self.read_error = e
                 return
+            self.rx_bytes += len(chunk)
             for byte in chunk:
                 if byte == 0x07:  # BEL is always sent on its own, never inside a line
                     self._log("<-", BEL)
@@ -184,7 +188,12 @@ class SlcanPort:
         except queue.Empty:
             if self.read_error:
                 raise TestFailure(f"{self.name}: serial read failed: {self.read_error}") from None
-            raise TestFailure(f"{self.name}: no reply within {timeout} s") from None
+            msg = f"{self.name}: no reply within {timeout} s"
+            if self.rx_bytes == 0:
+                msg += " (no byte received since the port was opened)"
+            elif self._line:
+                msg += f" (unterminated input {bytes(self._line)!r})"
+            raise TestFailure(msg) from None
 
     def command(self, cmd: str) -> str:
         self.write(cmd + "\r")
@@ -256,6 +265,19 @@ class SlcanPort:
         self._reader.join()
         self.ser.close()
 
+    def probe(self) -> str | None:
+        """Check that the board answers 'V'; returns an error message or None."""
+        self.write("\r")  # end any partial line a previous run left behind
+        time.sleep(0.2)
+        self.drain()
+        try:
+            v = self.command("V")
+        except TestFailure as e:
+            return str(e)
+        if not re.fullmatch(r"V[0-9A-F]{4}", v):
+            return f"{self.name}: 'V' answered {show(v)}"
+        return None
+
 
 class Bench:
     def __init__(self, a: SlcanPort, b: SlcanPort, args: argparse.Namespace):
@@ -324,6 +346,16 @@ def identification(bench: Bench) -> str:
             raise TestFailure(f"{p.name}: V -> {show(v)}, N -> {show(n)}")
         out.append(f"{p.name} {v} {n}")
     return ", ".join(out)
+
+
+@test
+def pipelined_commands(bench: Bench) -> None:
+    """64 commands in one write each get a reply: no input byte is lost at full baud rate."""
+    for p in bench.ports:
+        p.write("V\r" * 64)
+        for i in range(64):
+            if not re.fullmatch(r"V[0-9A-F]{4}", got := p.response()):
+                raise TestFailure(f"{p.name}: reply {i + 1} of 64 to back-to-back 'V' was {show(got)}")
 
 
 @test
@@ -432,13 +464,14 @@ def rejected_commands(bench: Bench) -> None:
 
 @test
 def closed_channel(bench: Bench) -> None:
-    """Closed channel: transmit and 'F' are refused, S0-S8/Y0-Y5 accepted."""
+    """Closed channel: transmit and 'F' are refused, S0-S8/Y0-Y4 accepted, Y5 refused."""
     a, b = bench.ports
     a.expect_ack("C")
-    for cmd in ("C", "F", "t1230", "d1230", "S9", "Y6", "Z2", "S", "Y", "Z"):
+    # Y5: 48 MHz FDCAN clock / 5 Mbit/s = 9.6 time quanta, not an integer
+    for cmd in ("C", "F", "t1230", "d1230", "S9", "Y5", "Y6", "Z2", "S", "Y", "Z"):
         a.expect_nack(cmd)
     rejected = []
-    for cmd in [f"S{i}" for i in range(9)] + [f"Y{i}" for i in range(6)]:
+    for cmd in [f"S{i}" for i in range(9)] + [f"Y{i}" for i in range(len(DATA_BITRATES))]:
         if a.command(cmd) != "":
             rejected.append(cmd)
     a.expect_ack(f"S{bench.args.bitrate}")
@@ -551,20 +584,30 @@ def burst_bidirectional(bench: Bench) -> str:
 
 @test
 def listen_only(bench: Bench) -> None:
-    """A board opened with 'L' neither ACKs nor transmits; 'C' discards pending frames."""
+    """A board opened with 'L' neither ACKs nor transmits but receives; 'C' discards pending frames."""
     a, b = bench.ports
     b.expect_ack("C")
     b.expect_ack("L")
     b.send(data_frame(0x555, b"\x55"))  # queued, but must never reach the bus
-    a.send(data_frame(0x123, b"\x01"))  # nobody ACKs it
+    sent = data_frame(0x123, b"\x01")
+    a.send(sent)  # nobody ACKs it, so A retransmits it until 'C'
     time.sleep(0.1)
-    a.expect_silence(0.0)
-    b.expect_silence(0.0)
+    a.expect_silence(0.0)  # B's frame never reached the bus
     expect_flags(a, allowed=0xFF, required=F_ERROR_PASSIVE)
+
+    # Receivers ignore the ACK slot, so every retransmission is a valid frame for B
+    for p in bench.ports:
+        p.expect_ack("C")
+    time.sleep(0.1)  # let B's serial TX buffer drain
+    replies, frames = b.drain()
+    if replies:
+        raise TestFailure(f"B: unexpected replies {[show(r) for r in replies]}")
+    if not frames or any(f != sent for f in frames):
+        others = sorted({str(f) for f in frames if f != sent})
+        raise TestFailure(f"B: expected only copies of {sent}, got {len(frames)} frames, others {others}")
 
     # Reopen both: the aborted frames must not show up afterwards
     for p in bench.ports:
-        p.expect_ack("C")
         p.expect_ack("O")
     transfer(a, b, data_frame(0x124, b"\x02"))
     transfer(b, a, data_frame(0x556, b"\x56"))
@@ -612,8 +655,8 @@ def main() -> int:
         help="nominal bitrate index S0-S8: " + " ".join(BITRATES) + " (default: 6)",
     )
     parser.add_argument(
-        "--data-bitrate", type=int, choices=range(6), default=2, metavar="0-5",
-        help="CAN FD data bitrate index Y0-Y5: " + " ".join(DATA_BITRATES) + " (default: 2)",
+        "--data-bitrate", type=int, choices=range(len(DATA_BITRATES)), default=2, metavar="0-4",
+        help="CAN FD data bitrate index Y0-Y4: " + " ".join(DATA_BITRATES) + " (default: 2)",
     )
     parser.add_argument("--burst", type=int, default=1000, help="frames per burst stream (default: %(default)s)")
     parser.add_argument("--seed", type=int, default=random.randrange(1 << 32), help="random seed for IDs/data")
@@ -643,6 +686,15 @@ def main() -> int:
     print(f"A={args.port_a} B={args.port_b} S{args.bitrate} ({BITRATES[args.bitrate]}) "
           f"Y{args.data_bitrate} ({DATA_BITRATES[args.data_bitrate]}) seed={args.seed}")
     bench = Bench(a, b, args)
+    errors = [e for e in (a.probe(), b.probe()) if e]
+    if errors:
+        for e in errors:
+            print(f"board not responding: {e}", file=sys.stderr)
+        print("Check that the board runs slcan_bridge, --baud matches the firmware "
+              "(1000000), and no other program has the port open.", file=sys.stderr)
+        a.close()
+        b.close()
+        return 2
     failed = []
     try:
         for t in tests:

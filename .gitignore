@@ -3,3 +3,4 @@
 deps
 zephyr-sdk-*
 build
+__pycache__

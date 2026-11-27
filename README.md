@@ -70,7 +70,31 @@ Flash both boards and wire their CAN connectors together (CANH-CANH, CANL-CANL, 
 ./test-boards.py -k burst -v         # run tests matching "burst", log all serial traffic
 ```
 
-`uv` provides `pyserial`; `.venv/bin/python test-boards.py` works as well. Options set the ports (`--port-a`, `--port-b`), bitrates (`--bitrate 0-8`, `--data-bitrate 0-5`), burst length (`--burst`) and random seed (`--seed`). Before each test both channels are reopened at the chosen bitrates. The tests send Classic, extended, RTR and CAN FD frames (all DLCs, with and without BRS) both ways and compare them. They also check rejected commands, line endings, timestamps, sequenced bursts in each direction and both at once, listen-only mode, and the TX mailboxes filling when no node ACKs. The exit code is 0 only if every test passes.
+`uv` provides `pyserial`; `.venv/bin/python test-boards.py` works as well. Options set the ports (`--port-a`, `--port-b`), bitrates (`--bitrate 0-8`, `--data-bitrate 0-4`), burst length (`--burst`) and random seed (`--seed`). Before each test both channels are reopened at the chosen bitrates. The tests send Classic, extended, RTR and CAN FD frames (all DLCs, with and without BRS) both ways and compare them. They also check rejected commands, line endings, timestamps, sequenced bursts in each direction and both at once, listen-only mode, and the TX mailboxes filling when no node ACKs. The exit code is 0 only if every test passes.
+
+Before the tests, the script sends `V` to each board. If a board does not answer, it reports whether any bytes arrived at all (none: board not running the firmware, wrong port, or the port held by another program; unterminated bytes: baud mismatch) and exits with code 2.
+
+```text
+A=/dev/ttyACM0 B=/dev/ttyACM1 S6 (500k) Y2 (2M) seed=3888220846
+PASS identification: A V0102 NC092, B V0102 NC092
+PASS pipelined_commands
+PASS classic_standard
+PASS classic_extended
+PASS remote_frames
+PASS fd_frames
+PASS lowercase_hex
+PASS line_terminators
+PASS rejected_commands
+PASS closed_channel
+PASS timestamps: board 203 ms vs host 200 ms
+PASS burst_classic: 1000 frames per stream in 1.95 s (513 frames/s; A->B 0 BEL); 1000 frames per stream in 1.93 s (519 frames/s; B->A 0 BEL)
+PASS burst_fd: 1000 frames per stream in 3.02 s (331 frames/s; A->B 0 BEL); 1000 frames per stream in 3.01 s (332 frames/s; B->A 0 BEL)
+PASS burst_bidirectional: 1000 frames per stream in 3.02 s (662 frames/s; A->B 0 BEL, B->A 0 BEL)
+PASS listen_only
+PASS no_ack: 3 frames queued before BEL, F22
+
+16/16 passed
+```
 
 ## Firmware behavior
 
@@ -94,7 +118,11 @@ Flash both boards and wire their CAN connectors together (CANH-CANH, CANL-CANL, 
 
 ### CAN FD
 
-`O` and `L` always open the controller in CAN FD mode. Classic CAN frames are sent and received unchanged, and `d`/`D`/`b`/`B` work without a prior `Y`. The data phase defaults to 2 Mbit/s (nominal: 500 kbit/s); `Y0`-`Y5` change it while the channel is closed. The on-board MCP2562FD transceiver is rated up to 5 Mbit/s.
+`O` and `L` always open the controller in CAN FD mode. Classic CAN frames are sent and received unchanged, and `d`/`D`/`b`/`B` work without a prior `Y`. The data phase defaults to 2 Mbit/s (nominal: 500 kbit/s); `Y0`-`Y4` change it while the channel is closed. `Y5` (5 Mbit/s) is answered with BEL: the FDCAN clock is the 48 MHz HSE, and 48 MHz / 5 Mbit/s = 9.6 time quanta per bit is not an integer. The on-board MCP2562FD transceiver is rated up to 5 Mbit/s.
+
+### Listen-only (`L`)
+
+A channel opened with `L` sends no ACKs and no frames, but it receives. Receivers ignore the ACK slot, so when no other node ACKs a frame, every retransmission of it is a valid frame to the listener: it reports the same frame repeatedly until the sender closes its channel.
 
 ### Timestamps (`Z`)
 
@@ -118,7 +146,7 @@ At 1 Mbaud the serial link carries about 100 kB/s. A busy bus produces more than
 4. `CONFIG_CAN_ACCEPT_RTR` was unset, so the driver rejected every incoming RTR frame. It is now enabled in `prj.conf`.
 5. `F` always returned `F00`. It now reports real flags (see above).
 6. `Z` was ACKed without adding timestamps. `Z1`/`Z0` now turn millisecond timestamps on and off (see above).
-7. The main loop woke every 100 µs. It now sleeps in `k_poll` on the CAN RX message queue and a semaphore given by the UART RX interrupt.
+7. The main loop woke every 100 µs. It now sleeps in `k_poll` on the CAN RX message queue and a semaphore given when UART data arrives.
 8. FD mode was enabled only after `Y` and could not be disabled again. The channel now always opens FD-capable, so `d`/`D`/`b`/`B` work without `Y`.
 9. Results of the startup bitrate calls were ignored; the firmware now stops if they fail. `S`/`Y` no longer change state when the bitrate is rejected.
 10. After a command line overflowed the 256-byte buffer, the rest of the line was parsed as a new command. It is now discarded up to the end of the line.
@@ -126,10 +154,7 @@ At 1 Mbaud the serial link carries about 100 kB/s. A busy bus produces more than
 12. `\r\n` from the host produced two ACKs. The `\n` of a CRLF pair is now ignored.
 13. The overlay's redundant `&fdcan1 { status = "okay"; }` was removed; the board DTS already enables `fdcan1`.
 14. The main stack was ~98% full on the transmit path with no overflow detection. The large buffers are now `static` and the MPU stack guard is enabled (see below).
-
-### Open concerns
-
-- Whether the ST-LINK virtual COM port handles 1 Mbaud has not been checked on hardware.
+15. At 1 Mbaud, commands sent back to back lost bytes (bytes 3-5 of a burst on hardware), so the board stopped answering after the first multi-command write. USART2 has no RX FIFO, and the interrupt-driven RX path was held off for longer than one byte time (10 µs). The UART now uses the async API with DMA: RX into a circular 256-byte buffer, TX straight from the ring buffer. The `pipelined_commands` test sends 64 commands in one write.
 
 ### Stack usage
 
