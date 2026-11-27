@@ -1,0 +1,52 @@
+From 6cfafba540a8a9b3430744ccb298e6dfd6cf8672 Mon Sep 17 00:00:00 2001
+From: Eric Bradley <eric@basepowercompany.com>
+Date: Fri, 9 Oct 2026 20:05:15 -0500
+Subject: [PATCH] drivers: can: mcan: ignore Tx events for completed Tx Buffers
+
+When a Tx Event FIFO new entry (IR.TEFN) and a bus-off state change are
+pending in the same pass of can_mcan_line_0_isr(), the state change
+handler runs first and completes every Tx Buffer with -ENETUNREACH,
+clearing its callback. The Tx event handler then reads the event of a
+frame that was transmitted before bus-off and calls the cleared, NULL,
+callback.
+
+Skip Tx events whose Tx Buffer no longer has a callback. The event is
+still acknowledged, and tx_sem is no longer given a second time for the
+same Tx Buffer.
+
+Reproduced on an STM32G431 by masking the FDCAN interrupts while a
+transmitted frame's Tx event is pending and the controller goes bus-off.
+
+Fixes #121845
+
+Assisted-by: Amp:claude-opus-5.5
+Signed-off-by: Eric Bradley <eric@basepowercompany.com>
+---
+ drivers/can/can_mcan.c | 12 ++++++++----
+ 1 file changed, 8 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/can/can_mcan.c b/drivers/can/can_mcan.c
+index baf974adb3b1e..40a5eb0647979 100644
+--- a/drivers/can/can_mcan.c
++++ b/drivers/can/can_mcan.c
+@@ -568,12 +568,16 @@ static void can_mcan_tx_event_handler(const struct device *dev)
+ 
+ 		__ASSERT_NO_MSG(tx_idx < cbs->num_tx);
+ 		tx_cb = cbs->tx[tx_idx].function;
+-		user_data = cbs->tx[tx_idx].user_data;
+-		cbs->tx[tx_idx].function = NULL;
+ 
+-		k_sem_give(&data->tx_sem);
++		/* The bus-off handler may already have completed this Tx Buffer */
++		if (tx_cb != NULL) {
++			user_data = cbs->tx[tx_idx].user_data;
++			cbs->tx[tx_idx].function = NULL;
+ 
+-		tx_cb(dev, 0, user_data);
++			k_sem_give(&data->tx_sem);
++
++			tx_cb(dev, 0, user_data);
++		}
+ 
+ 		err = can_mcan_read_reg(dev, CAN_MCAN_TXEFS, &txefs);
+ 		if (err != 0) {

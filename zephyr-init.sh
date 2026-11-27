@@ -18,8 +18,16 @@ west config --local manifest.path .
 west config --local manifest.file west.yml
 west config --local zephyr.base deps/zephyr
 
+# Revert patches applied by an earlier run: west update cannot check out a new
+# revision over locally modified files.
+if [ -d deps/zephyr ]; then
+    west patch clean
+fi
 west update --narrow --fetch-opt=--depth=1
 west packages pip --install
+
+# Local fixes to Zephyr, listed in zephyr/patches.yml
+west patch apply
 
 # west reuses an SDK of the same version found anywhere CMake looks (package
 # registry, ~, /opt, ...) and then ignores -b. Require the in-repo copy.

@@ -1,0 +1,34 @@
+Subject: [PATCH] drivers: can: mcan: Zero out frame struct when constructing
+ new CAN frame
+
+Backport of upstream commit 1e1855620db4350bc8c686094e591a9d2bcb348b.
+
+Currently, the CAN frame is only zeroed at the start of the function,
+and if multiple frames are read in a single pass, any flags that were
+ORed into the flags field will be carried into later frames, even if the
+later frame should not actually have those flags set. Instead, leave the
+frame variable uninitialised and zero it out on each iteration loop.
+
+Signed-off-by: Zee Yudenko <zyudenko@internships.antmicro.com>
+
+diff --git a/drivers/can/can_mcan.c b/drivers/can/can_mcan.c
+--- a/drivers/can/can_mcan.c
++++ b/drivers/can/can_mcan.c
+@@ -719,7 +719,7 @@ static void can_mcan_get_message(const struct device *dev, uint16_t fifo_offset,
+ 	const struct can_mcan_config *config = dev->config;
+ 	const struct can_mcan_callbacks *cbs = config->callbacks;
+ 	struct can_mcan_rx_fifo_hdr hdr;
+-	struct can_frame frame = {0};
++	struct can_frame frame;
+ 	can_rx_callback_t cb;
+ 	void *user_data;
+ 	uint32_t get_idx;
+@@ -745,6 +745,8 @@ static void can_mcan_get_message(const struct device *dev, uint16_t fifo_offset,
+ 			return;
+ 		}
+ 
++		memset(&frame, 0, sizeof(frame));
++
+ 		frame.dlc = hdr.dlc;
+ 
+ 		if (hdr.rtr != 0) {

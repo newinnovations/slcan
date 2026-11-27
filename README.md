@@ -23,9 +23,10 @@ From the repository root, run:
 The script:
 
 1. Creates a Python virtual environment (with pip, which `west packages pip` needs) and installs West into it.
-2. Configures this directory as the West workspace root and shallowly updates the projects pinned by `west.yml`.
+2. Configures this directory as the West workspace root and shallowly updates the projects pinned by `west.yml`. On a rerun it first reverts the Zephyr patches (`west patch clean`), so the update starts from unmodified trees.
 3. Installs the Python requirements of those projects.
-4. Runs `west sdk install`, which downloads the Zephyr SDK version named in `deps/zephyr/SDK_VERSION`, checks it against the release `sha256.sum`, extracts it into this directory, and runs its `setup.sh` to install the `arm-zephyr-eabi` GNU toolchain and the host tools.
+4. Applies the patches listed in `zephyr/patches.yml` (`west patch apply`, see [Zephyr patches](#zephyr-patches)).
+5. Runs `west sdk install`, which downloads the Zephyr SDK version named in `deps/zephyr/SDK_VERSION`, checks it against the release `sha256.sum`, extracts it into this directory, and runs its `setup.sh` to install the `arm-zephyr-eabi` GNU toolchain and the host tools.
 
 The script is safe to rerun. If an SDK of the same version is already installed, West skips the download but runs `setup.sh` again. West looks for an installed SDK wherever CMake finds one (the user package registry, `~`, `/opt`, ...). If it picks one outside this directory, the script stops with an error; remove or unregister that SDK and rerun.
 
@@ -41,6 +42,18 @@ build/                    Build output of make.sh
 ```
 
 Outside it, the SDK's `setup.sh` registers the SDK in the CMake user package registry under `~/.cmake/packages/Zephyr-sdk/`.
+
+### Zephyr patches
+
+`zephyr/patches/zephyr/` holds local changes to Zephyr v4.4.2. `zephyr/patches.yml` lists them with their SHA-256 checksums; `west patch apply` refuses a patch whose checksum does not match.
+
+| Patch | Purpose |
+| ----- | ------- |
+| `0001-drivers-can-mcan-add-tx-fifo-mode.patch` | Adds `CONFIG_CAN_MCAN_TX_FIFO` (enabled in `prj.conf`), so the FDCAN sends frames in the order the host queued them. |
+| `0002-drivers-can-mcan-zero-out-rx-frame.patch` | Backport of upstream `1e1855620db4`: flags of a received frame no longer carry over to the next frame read in the same interrupt. |
+| `0003-drivers-can-mcan-ignore-tx-events-for-completed-tx-buffers.patch` | Backport of upstream `6cfafba540a8`: a frame completing while the controller goes bus-off no longer calls a NULL Tx callback. |
+
+`west patch list` shows the patches, `west patch clean` reverts them (it runs `git checkout .` and `git clean -dfx` in `deps/zephyr`, discarding any other local change there), and `west patch apply` applies them again. To change a patch, edit Zephyr in `deps/zephyr`, write that change's diff (`git -C deps/zephyr diff`, without the other patches' hunks) to its patch file, and update the file's `sha256sum` in `zephyr/patches.yml`.
 
 ### Build
 
@@ -158,7 +171,9 @@ At 1 Mbaud the serial link carries about 100 kB/s. A busy bus produces more than
 13. The overlay's redundant `&fdcan1 { status = "okay"; }` was removed; the board DTS already enables `fdcan1`.
 14. The main stack was ~98% full on the transmit path with no overflow detection. The large buffers are now `static` and the MPU stack guard is enabled (see below).
 15. At 1 Mbaud, commands sent back to back lost bytes (bytes 3-5 of a burst on hardware), so the board stopped answering after the first multi-command write. USART2 has no RX FIFO, and the interrupt-driven RX path was held off for longer than one byte time (10 µs). The UART now uses the async API with DMA: RX into a circular 256-byte buffer, TX straight from the ring buffer. The `pipelined_commands` test sends 64 commands in one write.
-16. The FDCAN TX mailboxes ran as a priority queue: pending frames left lowest ID first, and frames with the same ID in unpredictable order, which breaks protocols such as ISO-TP that rely on frame order. `CONFIG_CAN_MCAN_TX_FIFO` now sends them in the order the host queued them. The `tx_order` test queues descending IDs while no node ACKs and checks the receive order.
+16. The FDCAN TX mailboxes ran as a priority queue: pending frames left lowest ID first, and frames with the same ID in unpredictable order, which breaks protocols such as ISO-TP that rely on frame order. `CONFIG_CAN_MCAN_TX_FIFO` (Zephyr patch 0001) now sends them in the order the host queued them. The `tx_order` test queues descending IDs while no node ACKs and checks the receive order.
+17. Zephyr 4.4.2 zeroed the received frame once per interrupt, not per frame, so flags carried over when one interrupt read several frames: a standard frame after an extended one was reported as `T`, a classic frame after a CAN FD one as `d`/`b`. Zephyr patch 0002 backports the upstream fix.
+18. In Zephyr 4.4.2, when a frame's Tx event and a bus-off were handled in the same interrupt, the bus-off handler completed every Tx buffer first, and the Tx event handler then called the cleared, NULL, callback, crashing the firmware, and gave the TX semaphore a second time. Zephyr patch 0003 backports the upstream fix.
 
 ### Stack usage
 

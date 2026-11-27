@@ -1,0 +1,127 @@
+Subject: [PATCH] drivers: can: mcan: add Tx FIFO mode
+
+The M_CAN Tx buffers are configured as a Tx Queue, which sends the pending
+frame with the lowest CAN ID first and frames with the same ID in an
+unpredictable order. Add CONFIG_CAN_MCAN_TX_FIFO to configure them as a
+Tx FIFO instead, so frames are sent in the order they were passed to
+can_send(). The put index is tracked in software and reset together with
+the hardware index when CCCR.CCE is set in can_mcan_stop().
+
+diff --git a/drivers/can/Kconfig.mcan b/drivers/can/Kconfig.mcan
+index db09fc80..251d54df 100644
+--- a/drivers/can/Kconfig.mcan
++++ b/drivers/can/Kconfig.mcan
+@@ -7,3 +7,12 @@ config CAN_MCAN
+ 	bool
+ 	help
+ 	  Enable the Bosch M_CAN CAN IP module driver backend.
++
++config CAN_MCAN_TX_FIFO
++	bool "Transmit frames in FIFO order"
++	depends on CAN_MCAN
++	help
++	  Configure the Tx buffers as a Tx FIFO instead of a Tx Queue. Frames are
++	  sent in the order they were passed to can_send(). A Tx Queue sends the
++	  frame with the lowest CAN ID first, and frames with the same ID in an
++	  unpredictable order.
+diff --git a/drivers/can/can_mcan.c b/drivers/can/can_mcan.c
+index fcd689aa..e66825e2 100644
+--- a/drivers/can/can_mcan.c
++++ b/drivers/can/can_mcan.c
+@@ -379,6 +379,13 @@ int can_mcan_stop(const struct device *dev)
+ 
+ 	can_mcan_enable_configuration_change(dev);
+ 
++#ifdef CONFIG_CAN_MCAN_TX_FIFO
++	/* Setting CCCR.CCE reset the Tx FIFO put index in TXFQS */
++	k_mutex_lock(&data->tx_mtx, K_FOREVER);
++	data->tx_put_idx = 0U;
++	k_mutex_unlock(&data->tx_mtx);
++#endif /* CONFIG_CAN_MCAN_TX_FIFO */
++
+ 	data->common.started = false;
+ 
+ 	for (tx_idx = 0U; tx_idx < cbs->num_tx; tx_idx++) {
+@@ -1017,6 +1024,11 @@ int can_mcan_send(const struct device *dev, const struct can_frame *frame, k_tim
+ 
+ 	k_mutex_lock(&data->tx_mtx, K_FOREVER);
+ 
++#ifdef CONFIG_CAN_MCAN_TX_FIFO
++	/* Tx FIFO: buffers are used in order, so the one at the put index is free */
++	put_idx = data->tx_put_idx;
++	__ASSERT_NO_MSG(cbs->tx[put_idx].function == NULL);
++#else  /* CONFIG_CAN_MCAN_TX_FIFO */
+ 	/* Acquire a free TX buffer */
+ 	for (int i = 0; i < cbs->num_tx; i++) {
+ 		if (cbs->tx[i].function == NULL) {
+@@ -1024,6 +1036,7 @@ int can_mcan_send(const struct device *dev, const struct can_frame *frame, k_tim
+ 			break;
+ 		}
+ 	}
++#endif /* !CONFIG_CAN_MCAN_TX_FIFO */
+ 
+ 	/* A free TX buffer should always be available since the data->tx_sem was acquired */
+ 	__ASSERT_NO_MSG(put_idx < cbs->num_tx);
+@@ -1064,6 +1077,11 @@ int can_mcan_send(const struct device *dev, const struct can_frame *frame, k_tim
+ 		goto err_unlock;
+ 	}
+ 
++#ifdef CONFIG_CAN_MCAN_TX_FIFO
++	/* Tracked in software: TXFQS.TFQPI may not reflect the TXBAR write yet */
++	data->tx_put_idx = (put_idx + 1U) % cbs->num_tx;
++#endif /* CONFIG_CAN_MCAN_TX_FIFO */
++
+ 	k_mutex_unlock(&data->tx_mtx);
+ 	return 0;
+ 
+@@ -1371,7 +1389,10 @@ int can_mcan_configure_mram(const struct device *dev, uintptr_t mrba, uintptr_t
+ 
+ 	addr = mram - mrba + config->mram_offsets[CAN_MCAN_MRAM_CFG_TX_BUFFER];
+ 	reg = (addr & CAN_MCAN_TXBC_TBSA) | FIELD_PREP(CAN_MCAN_TXBC_TFQS,
+-		config->mram_elements[CAN_MCAN_MRAM_CFG_TX_BUFFER]) | CAN_MCAN_TXBC_TFQM;
++		config->mram_elements[CAN_MCAN_MRAM_CFG_TX_BUFFER]);
++	if (!IS_ENABLED(CONFIG_CAN_MCAN_TX_FIFO)) {
++		reg |= CAN_MCAN_TXBC_TFQM;
++	}
+ 	err = can_mcan_write_reg(dev, CAN_MCAN_TXBC, reg);
+ 	if (err != 0) {
+ 		return err;
+@@ -1414,6 +1435,9 @@ int can_mcan_init(const struct device *dev)
+ 	__ASSERT_NO_MSG(config->callbacks != NULL);
+ 
+ 	__ASSERT_NO_MSG(cbs->num_tx <= config->mram_elements[CAN_MCAN_MRAM_CFG_TX_BUFFER]);
++	/* The Tx FIFO wraps at its hardware size, so every buffer needs a callback slot */
++	__ASSERT_NO_MSG(!IS_ENABLED(CONFIG_CAN_MCAN_TX_FIFO) ||
++			cbs->num_tx == config->mram_elements[CAN_MCAN_MRAM_CFG_TX_BUFFER]);
+ 	__ASSERT_NO_MSG(cbs->num_std <= config->mram_elements[CAN_MCAN_MRAM_CFG_STD_FILTER]);
+ 	__ASSERT_NO_MSG(cbs->num_ext <= config->mram_elements[CAN_MCAN_MRAM_CFG_EXT_FILTER]);
+ 
+diff --git a/drivers/can/can_stm32_fdcan.c b/drivers/can/can_stm32_fdcan.c
+index e866e967..088bc658 100644
+--- a/drivers/can/can_stm32_fdcan.c
++++ b/drivers/can/can_stm32_fdcan.c
+@@ -505,7 +505,8 @@ static int can_stm32fd_init(const struct device *dev)
+ 	}
+ 
+ 	/* Setup STM32 FDCAN Tx buffer configuration register */
+-	ret = can_mcan_write_reg(dev, CAN_MCAN_TXBC, CAN_STM32FD_TXBC_TFQM);
++	ret = can_mcan_write_reg(dev, CAN_MCAN_TXBC,
++				 IS_ENABLED(CONFIG_CAN_MCAN_TX_FIFO) ? 0U : CAN_STM32FD_TXBC_TFQM);
+ 	if (ret != 0) {
+ 		return ret;
+ 	}
+diff --git a/include/zephyr/drivers/can/can_mcan.h b/include/zephyr/drivers/can/can_mcan.h
+index a929cd8d..4e6b50da 100644
+--- a/include/zephyr/drivers/can/can_mcan.h
++++ b/include/zephyr/drivers/can/can_mcan.h
+@@ -1066,6 +1066,10 @@ struct can_mcan_data {
+ 	struct k_sem tx_sem;
+ 	struct k_mutex tx_mtx;
+ 	void *custom;
++#ifdef CONFIG_CAN_MCAN_TX_FIFO
++	/* Tx FIFO put index, guarded by tx_mtx */
++	uint8_t tx_put_idx;
++#endif /* CONFIG_CAN_MCAN_TX_FIFO */
+ } __aligned(4);
+ 
+ /**

@@ -1,0 +1,51 @@
+# Local patches to the west projects, applied by zephyr-init.sh with
+# `west patch apply`. Paths are relative to zephyr/patches/. After changing a
+# patch, update its sha256sum (`sha256sum zephyr/patches/<path>`).
+#
+# `module` must be the project path, not the name: west patch resolves a name
+# that is also a directory below the workspace root as that directory, so
+# `module: zephyr` would point at this directory, and `west patch clean` would
+# run `git clean -dfx` here and delete the patches.
+patches:
+  - path: zephyr/0001-drivers-can-mcan-add-tx-fifo-mode.patch
+    sha256sum: b3e490caca7618f937c97301c7c79d68a7c5e95cb6db12ba397fd40bb43358f7
+    module: deps/zephyr
+    author: Martin van der Werff
+    email: github@newinnovations.nl
+    date: 2026-11-27
+    upstreamable: true
+    comments: |
+      Adds CONFIG_CAN_MCAN_TX_FIFO, enabled in slcan_bridge/prj.conf, so the
+      FDCAN sends frames in the order the host queued them instead of lowest
+      CAN ID first.
+
+  - path: zephyr/0002-drivers-can-mcan-zero-out-rx-frame.patch
+    sha256sum: cb708a48375f54644e94115b3905f8e7c513b324ea991c49e4ce31c1717ccdf2
+    module: deps/zephyr
+    author: Zee Yudenko
+    email: zyudenko@internships.antmicro.com
+    date: 2026-08-17
+    upstreamable: true
+    merge-status: true
+    merge-commit: 1e1855620db4350bc8c686094e591a9d2bcb348b
+    merge-date: 2026-08-28
+    comments: |
+      Backport. Without it, flags of one received frame carry over to the next
+      frame read in the same interrupt: a standard frame after an extended one
+      is reported as extended, a classic frame after a CAN FD one as CAN FD.
+
+  - path: zephyr/0003-drivers-can-mcan-ignore-tx-events-for-completed-tx-buffers.patch
+    sha256sum: 5b4c23de6b43dbd0beee625cce709d3cea95c22a78ca6f9945075bcca494548a
+    module: deps/zephyr
+    author: Eric Bradley
+    email: eric@basepowercompany.com
+    date: 2026-10-09
+    upstreamable: true
+    issue: https://github.com/zephyrproject-rtos/zephyr/issues/121845
+    merge-status: true
+    merge-commit: 6cfafba540a8a9b3430744ccb298e6dfd6cf8672
+    merge-date: 2026-10-19
+    comments: |
+      Backport, unmodified upstream commit. Without it, a Tx event pending
+      when the controller goes bus-off calls the Tx callback the bus-off
+      handler already cleared (a NULL call) and gives tx_sem twice.
