@@ -74,6 +74,8 @@ Flash both boards and wire their CAN connectors together (CANH-CANH, CANL-CANL, 
 
 Before the tests, the script sends `V` to each board. If a board does not answer, it reports whether any bytes arrived at all (none: board not running the firmware, wrong port, or the port held by another program; unterminated bytes: baud mismatch) and exits with code 2.
 
+![Test with two Nucleo C092RC boards connected via CAN](doc/two-boards.jpg "Test with two Nucleo C092RC boards connected via CAN")
+
 ```text
 A=/dev/ttyACM0 B=/dev/ttyACM1 S6 (500k) Y2 (2M) seed=3888220846
 PASS identification: A V0102 NC092, B V0102 NC092
