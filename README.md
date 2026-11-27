@@ -60,6 +60,18 @@ To remove the generated local environment, workspace, build output, SDK, and the
 ./clean-all.sh
 ```
 
+### Test with two boards
+
+Flash both boards and wire their CAN connectors together (CANH-CANH, CANL-CANL, GND, terminated at both ends). Then run:
+
+```sh
+./test-boards.py                     # board A /dev/ttyACM0, board B /dev/ttyACM1
+./test-boards.py --list              # show the tests
+./test-boards.py -k burst -v         # run tests matching "burst", log all serial traffic
+```
+
+`uv` provides `pyserial`; `.venv/bin/python test-boards.py` works as well. Options set the ports (`--port-a`, `--port-b`), bitrates (`--bitrate 0-8`, `--data-bitrate 0-5`), burst length (`--burst`) and random seed (`--seed`). Before each test both channels are reopened at the chosen bitrates. The tests send Classic, extended, RTR and CAN FD frames (all DLCs, with and without BRS) both ways and compare them. They also check rejected commands, line endings, timestamps, sequenced bursts in each direction and both at once, listen-only mode, and the TX mailboxes filling when no node ACKs. The exit code is 0 only if every test passes.
+
 ## Firmware behavior
 
 ### Status flags (`F`)
@@ -74,11 +86,11 @@ To remove the generated local environment, workspace, build output, SDK, and the
 | 3   | Serial input from the host dropped: the UART RX buffer was full                     |
 | 5   | Error passive                                                                       |
 | 6   | Arbitration lost (reported only in one-shot mode, which this firmware does not use) |
-| 7   | Bus error: a transmit failed (e.g. missing ACK) or the controller went bus-off      |
+| 7   | Bus-off: the controller went bus-off and discarded the frames in its TX mailboxes   |
 
 ### Transmit acknowledgement
 
-`\r` after a transmit command means the frame was queued in a CAN TX mailbox, not that it was sent. Transmit failures show up in `F` bit 7. If no node ACKs the frames, the mailboxes stay full and later transmit commands are answered with BEL and set bit 1.
+`\r` after a transmit command means the frame was queued in a CAN TX mailbox, not that it was sent. A frame that no node ACKs is not reported as failed: the controller retransmits it until a node ACKs it or the channel is closed with `C`, and its transmit error counter rises until it is error passive (`F` bits 2 and 5). Meanwhile the mailboxes stay full, so later transmit commands are answered with BEL and set bit 1.
 
 ### CAN FD
 

@@ -6,7 +6,7 @@ SCRIPT_DIR=$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")
 cd "$SCRIPT_DIR"
 
 if [ ! -d .venv ]; then
-    uv venv --seed --link-mode=copy
+    uv venv --seed --link-mode=copy --python 3.13
 fi
 . ./.venv/bin/activate
 uv pip install --link-mode=copy west
