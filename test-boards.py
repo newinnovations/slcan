@@ -640,6 +640,35 @@ def no_ack(bench: Bench) -> str:
     return f"{accepted} frames queued before BEL, F{flags:02X}"
 
 
+@test
+def tx_order(bench: Bench) -> str:
+    """Frames pending in the TX mailboxes leave in the order sent, not by ID priority."""
+    a, b = bench.ports
+    b.expect_ack("C")  # no ACK: every frame A accepts stays pending
+    sent: list[Frame] = []
+    for can_id in range(0x700, 0x000, -0x100):  # descending: lowest ID queued last
+        frame = data_frame(can_id, bytes([len(sent)]))
+        got = a.command(frame.encode())
+        if got == BEL:
+            break
+        if got != "":
+            raise TestFailure(f"{a.name}: transmit answered {show(got)}")
+        sent.append(frame)
+    else:
+        raise TestFailure(f"{a.name}: {len(sent)} unacknowledged frames accepted, expected BEL")
+    if len(sent) < 2:
+        raise TestFailure(f"{a.name}: only {len(sent)} frame(s) queued, order cannot be checked")
+
+    b.expect_ack("O")  # B now ACKs: A's pending frames go out one by one
+    got = [b.receive() for _ in sent]
+    if got != sent:
+        raise TestFailure(
+            f"{a.name}->{b.name}: sent {[str(f) for f in sent]}, received {[str(f) for f in got]}"
+        )
+    b.expect_silence()
+    return f"{len(sent)} pending frames, IDs {' '.join(f'{f.id:03X}' for f in sent)}"
+
+
 # ---------------------------------------------------------------- runner
 
 

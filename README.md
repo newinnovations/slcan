@@ -70,14 +70,14 @@ Flash both boards and wire their CAN connectors together (CANH-CANH, CANL-CANL, 
 ./test-boards.py -k burst -v         # run tests matching "burst", log all serial traffic
 ```
 
-`uv` provides `pyserial`; `.venv/bin/python test-boards.py` works as well. Options set the ports (`--port-a`, `--port-b`), bitrates (`--bitrate 0-8`, `--data-bitrate 0-4`), burst length (`--burst`) and random seed (`--seed`). Before each test both channels are reopened at the chosen bitrates. The tests send Classic, extended, RTR and CAN FD frames (all DLCs, with and without BRS) both ways and compare them. They also check rejected commands, line endings, timestamps, sequenced bursts in each direction and both at once, listen-only mode, and the TX mailboxes filling when no node ACKs. The exit code is 0 only if every test passes.
+`uv` provides `pyserial`; `.venv/bin/python test-boards.py` works as well. Options set the ports (`--port-a`, `--port-b`), bitrates (`--bitrate 0-8`, `--data-bitrate 0-4`), burst length (`--burst`) and random seed (`--seed`). Before each test both channels are reopened at the chosen bitrates. The tests send Classic, extended, RTR and CAN FD frames (all DLCs, with and without BRS) both ways and compare them. They also check rejected commands, line endings, timestamps, sequenced bursts in each direction and both at once, listen-only mode, the TX mailboxes filling when no node ACKs, and that pending frames with descending IDs leave in the order sent. The exit code is 0 only if every test passes.
 
 Before the tests, the script sends `V` to each board. If a board does not answer, it reports whether any bytes arrived at all (none: board not running the firmware, wrong port, or the port held by another program; unterminated bytes: baud mismatch) and exits with code 2.
 
 ![Test with two Nucleo C092RC boards connected via CAN](doc/two-boards.jpg "Test with two Nucleo C092RC boards connected via CAN")
 
 ```text
-A=/dev/ttyACM0 B=/dev/ttyACM1 S6 (500k) Y2 (2M) seed=3888220846
+A=/dev/ttyACM0 B=/dev/ttyACM1 S6 (500k) Y2 (2M) seed=3796532915
 PASS identification: A V0102 NC092, B V0102 NC092
 PASS pipelined_commands
 PASS classic_standard
@@ -88,14 +88,15 @@ PASS lowercase_hex
 PASS line_terminators
 PASS rejected_commands
 PASS closed_channel
-PASS timestamps: board 203 ms vs host 200 ms
-PASS burst_classic: 1000 frames per stream in 1.95 s (513 frames/s; A->B 0 BEL); 1000 frames per stream in 1.93 s (519 frames/s; B->A 0 BEL)
-PASS burst_fd: 1000 frames per stream in 3.02 s (331 frames/s; A->B 0 BEL); 1000 frames per stream in 3.01 s (332 frames/s; B->A 0 BEL)
-PASS burst_bidirectional: 1000 frames per stream in 3.02 s (662 frames/s; A->B 0 BEL, B->A 0 BEL)
+PASS timestamps: board 204 ms vs host 201 ms
+PASS burst_classic: 1000 frames per stream in 1.99 s (502 frames/s; A->B 0 BEL); 1000 frames per stream in 2.00 s (501 frames/s; B->A 0 BEL)
+PASS burst_fd: 1000 frames per stream in 3.10 s (322 frames/s; A->B 0 BEL); 1000 frames per stream in 3.24 s (309 frames/s; B->A 0 BEL)
+PASS burst_bidirectional: 1000 frames per stream in 3.07 s (651 frames/s; A->B 0 BEL, B->A 0 BEL)
 PASS listen_only
 PASS no_ack: 3 frames queued before BEL, F22
+PASS tx_order: 3 pending frames, IDs 700 600 500
 
-16/16 passed
+17/17 passed
 ```
 
 ## Firmware behavior
@@ -157,6 +158,7 @@ At 1 Mbaud the serial link carries about 100 kB/s. A busy bus produces more than
 13. The overlay's redundant `&fdcan1 { status = "okay"; }` was removed; the board DTS already enables `fdcan1`.
 14. The main stack was ~98% full on the transmit path with no overflow detection. The large buffers are now `static` and the MPU stack guard is enabled (see below).
 15. At 1 Mbaud, commands sent back to back lost bytes (bytes 3-5 of a burst on hardware), so the board stopped answering after the first multi-command write. USART2 has no RX FIFO, and the interrupt-driven RX path was held off for longer than one byte time (10 µs). The UART now uses the async API with DMA: RX into a circular 256-byte buffer, TX straight from the ring buffer. The `pipelined_commands` test sends 64 commands in one write.
+16. The FDCAN TX mailboxes ran as a priority queue: pending frames left lowest ID first, and frames with the same ID in unpredictable order, which breaks protocols such as ISO-TP that rely on frame order. `CONFIG_CAN_MCAN_TX_FIFO` now sends them in the order the host queued them. The `tx_order` test queues descending IDs while no node ACKs and checks the receive order.
 
 ### Stack usage
 
