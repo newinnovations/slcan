@@ -521,6 +521,42 @@ def seq_fd(seq: int) -> Frame:
     return data_frame(0x0F1, seq.to_bytes(4, "big") * 16, fd=True, brs=True)
 
 
+def stream_seq(frame: Frame | str, make: Callable[[int], Frame]) -> int | None:
+    """Sequence number of a burst frame, None for anything else."""
+    if not isinstance(frame, Frame) or len(frame.data) < 4:
+        return None
+    seq = int.from_bytes(frame.data[:4], "big")
+    return seq if make(seq) == frame else None
+
+
+def received_seqs(rx: SlcanPort, make: Callable[[int], Frame], first: Frame) -> str:
+    """Sequence numbers of `first` and every frame still arriving after it, as
+    ranges ('?' for a foreign frame). After a mismatch at frame k, "k-1 - n-1"
+    is one duplicate in an otherwise complete stream; "k-1 - n-2" is a stream
+    running one frame behind that never delivers its last frame."""
+    frames: list[Frame | str] = [first]
+    while True:
+        try:
+            frames.append(rx.frames.get(timeout=RX_TIMEOUT))
+        except queue.Empty:
+            break
+    seqs = [stream_seq(f, make) for f in frames]
+    parts: list[str] = []
+    i = 0
+    while i < len(seqs):
+        start = seqs[i]
+        if start is None:
+            parts.append("?")
+            i += 1
+            continue
+        j = i
+        while j + 1 < len(seqs) and seqs[j + 1] == seqs[j] + 1:
+            j += 1
+        parts.append(str(start) if i == j else f"{start}-{seqs[j]}")
+        i = j + 1
+    return " ".join(parts)
+
+
 def run_burst(
     bench: Bench, streams: list[tuple[SlcanPort, SlcanPort, Callable[[int], Frame]]]
 ) -> str:
@@ -550,7 +586,12 @@ def run_burst(
         for seq in range(n):
             got, expected = rx.receive(), make(seq)
             if got != expected:
-                raise TestFailure(f"{tx.name}->{rx.name} frame {seq}: received {got}, expected {expected}")
+                rest = received_seqs(rx, make, got)
+                flags = ", ".join(f"{p.name} F{p.status():02X}" for p in bench.ports)
+                raise TestFailure(
+                    f"{tx.name}->{rx.name} frame {seq}: received {got}, expected {expected}; "
+                    f"from there on received {rest}, expected {seq}-{n - 1}; {flags}"
+                )
     for p in bench.ports:
         expect_flags(p, allowed=F_TX_FULL)  # BEL retries are fine, drops/errors are not
 
