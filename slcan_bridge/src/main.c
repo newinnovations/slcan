@@ -2,19 +2,34 @@
 #include <zephyr/device.h>
 #include <zephyr/drivers/can.h>
 #include <zephyr/drivers/uart.h>
+#include <zephyr/linker/section_tags.h>
 #include <zephyr/sys/ring_buffer.h>
 #include <string.h>
 #include <stdbool.h>
 
-/* Automatically resolves to fdcan1 and usart2 on nucleo_c092rc */
+/* fdcan1, and the ST-LINK VCP UART: usart2 on nucleo_c092rc, usart3 on nucleo_h7s3l8 */
 static const struct device *const can_dev = DEVICE_DT_GET(DT_CHOSEN(zephyr_canbus));
 static const struct device *const uart_dev = DEVICE_DT_GET(DT_CHOSEN(zephyr_console));
 
-/* Ring buffers sized for 64-byte CAN FD ASCII bursts */
+/* 'N' reply: a four-character name of the board */
+#if defined(CONFIG_BOARD_NUCLEO_C092RC)
+#define SLCAN_SERIAL_NUMBER "NC092\r"
+#elif defined(CONFIG_BOARD_NUCLEO_H7S3L8)
+#define SLCAN_SERIAL_NUMBER "NH7S3\r"
+#else
+#error "Unsupported board: add slcan_bridge/boards/<board>.overlay and a serial number"
+#endif
+
+/* Ring buffers sized for 64-byte CAN FD ASCII bursts.
+ * The TX DMA reads straight from uart_tx_rb, so its storage is __nocache: on
+ * boards with a D-cache (H7S3L8) the UART driver refuses cached DMA buffers.
+ * Without CONFIG_NOCACHE_MEMORY (C092RC) __nocache places nothing.
+ */
 #define UART_RX_BUF_SIZE 1024
 #define UART_TX_BUF_SIZE 4096
 RING_BUF_DECLARE(uart_rx_rb, UART_RX_BUF_SIZE);
-RING_BUF_DECLARE(uart_tx_rb, UART_TX_BUF_SIZE);
+static uint8_t uart_tx_rb_data[UART_TX_BUF_SIZE] __nocache;
+static struct ring_buf uart_tx_rb = RING_BUF_INIT(uart_tx_rb_data, UART_TX_BUF_SIZE);
 
 /* Given by the UART callback whenever bytes land in uart_rx_rb */
 K_SEM_DEFINE(uart_rx_sem, 0, 1);
@@ -67,17 +82,18 @@ static const uint32_t slcan_data_bitrates[] = {
     2000000, /* Y2: 2 Mbit/s */
     3000000, /* Y3: 3 Mbit/s */
     4000000, /* Y4: 4 Mbit/s */
-    5000000  /* Y5: 5 Mbit/s, always rejected: 48 MHz FDCAN clock / 5 Mbit/s = 9.6 tq */
+    5000000  /* Y5: 5 Mbit/s, needs an FDCAN clock 5 Mbit/s divides: rejected on C092RC
+              * (48 MHz HSE: 9.6 time quanta), accepted on H7S3L8 (60 MHz PLL2: 12) */
 };
 
 /* ---------------- UART (async API, DMA) ---------------- */
 
-/* USART2 has no RX FIFO, so at 1 Mbaud an RX interrupt held off for more than
- * one byte time (10 us) loses bytes. The DMA writes into this circular buffer
- * regardless of interrupt latency; the driver reports new data from the DMA
- * half/full interrupts and the USART idle-line interrupt.
+/* At 1 Mbaud a byte arrives every 10 us. USART2 of the C092RC has no RX FIFO,
+ * so an RX interrupt held off for longer loses bytes. The DMA writes into this
+ * circular buffer regardless of interrupt latency; the driver reports new data
+ * from the DMA half/full interrupts and the USART idle-line interrupt.
  */
-static uint8_t uart_rx_dma_buf[256];
+static uint8_t uart_rx_dma_buf[256] __nocache;
 
 /* Set while a DMA transmission from uart_tx_rb runs; guarded by irq_lock() */
 static bool uart_tx_busy;
@@ -434,7 +450,7 @@ static void process_slcan_command(const char *cmd, size_t len)
         break;
 
     case 'N': /* Serial number */
-        uart_send_str("NC092\r", 6);
+        uart_send_str(SLCAN_SERIAL_NUMBER, sizeof(SLCAN_SERIAL_NUMBER) - 1);
         break;
 
     case 'F': /* Read and clear status flags (channel must be open) */

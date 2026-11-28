@@ -47,8 +47,11 @@ F_TX_FULL = 0x02
 F_ERROR_PASSIVE = 0x20
 
 BITRATES = ("10k", "20k", "50k", "100k", "125k", "250k", "500k", "800k", "1M")
-# Y5 (5 Mbit/s) is not reachable from the 48 MHz FDCAN clock and is rejected
-DATA_BITRATES = ("500k", "1M", "2M", "3M", "4M")
+DATA_BITRATES = ("500k", "1M", "2M", "3M", "4M", "5M")
+# Highest Y index each board accepts, by its 'N' reply. Y5 (5 Mbit/s) needs an
+# FDCAN clock that 5 Mbit/s divides: the C092RC's 48 MHz HSE does not (9.6
+# time quanta), the H7S3L8's 60 MHz PLL2 does (12).
+MAX_DATA_BITRATE = {"NC092": 4, "NH7S3": 5}
 
 
 class TestFailure(Exception):
@@ -140,6 +143,7 @@ class SlcanPort:
         self.frames: queue.Queue[Frame | str] = queue.Queue()  # str: malformed line
         self.read_error: Exception | None = None
         self.rx_bytes = 0  # total bytes received, for diagnosing a silent board
+        self.max_data_bitrate = 0  # highest accepted Y index, set by probe()
         self._line = bytearray()  # bytes since the last '\r'
         self._stop = threading.Event()
         self._reader = threading.Thread(target=self._read_loop, name=f"{name}-rx", daemon=True)
@@ -266,16 +270,20 @@ class SlcanPort:
         self.ser.close()
 
     def probe(self) -> str | None:
-        """Check that the board answers 'V'; returns an error message or None."""
+        """Check that the board answers 'V' and 'N'; returns an error message or None."""
         self.write("\r")  # end any partial line a previous run left behind
         time.sleep(0.2)
         self.drain()
         try:
             v = self.command("V")
+            n = self.command("N")
         except TestFailure as e:
             return str(e)
         if not re.fullmatch(r"V[0-9A-F]{4}", v):
             return f"{self.name}: 'V' answered {show(v)}"
+        if n not in MAX_DATA_BITRATE:
+            return f"{self.name}: 'N' answered {show(n)}, not a known board ({' '.join(MAX_DATA_BITRATE)})"
+        self.max_data_bitrate = MAX_DATA_BITRATE[n]
         return None
 
 
@@ -464,14 +472,16 @@ def rejected_commands(bench: Bench) -> None:
 
 @test
 def closed_channel(bench: Bench) -> None:
-    """Closed channel: transmit and 'F' are refused, S0-S8/Y0-Y4 accepted, Y5 refused."""
+    """Closed channel: transmit and 'F' are refused, S0-S8 and the board's Y range accepted, higher Y refused."""
     a, b = bench.ports
     a.expect_ack("C")
-    # Y5: 48 MHz FDCAN clock / 5 Mbit/s = 9.6 time quanta, not an integer
-    for cmd in ("C", "F", "t1230", "d1230", "S9", "Y5", "Y6", "Z2", "S", "Y", "Z"):
+    y_max = a.max_data_bitrate
+    refused = ["C", "F", "t1230", "d1230", "S9", "Y6", "Z2", "S", "Y", "Z"]
+    refused += [f"Y{i}" for i in range(y_max + 1, len(DATA_BITRATES))]
+    for cmd in refused:
         a.expect_nack(cmd)
     rejected = []
-    for cmd in [f"S{i}" for i in range(9)] + [f"Y{i}" for i in range(len(DATA_BITRATES))]:
+    for cmd in [f"S{i}" for i in range(9)] + [f"Y{i}" for i in range(y_max + 1)]:
         if a.command(cmd) != "":
             rejected.append(cmd)
     a.expect_ack(f"S{bench.args.bitrate}")
@@ -725,8 +735,9 @@ def main() -> int:
         help="nominal bitrate index S0-S8: " + " ".join(BITRATES) + " (default: 6)",
     )
     parser.add_argument(
-        "--data-bitrate", type=int, choices=range(len(DATA_BITRATES)), default=2, metavar="0-4",
-        help="CAN FD data bitrate index Y0-Y4: " + " ".join(DATA_BITRATES) + " (default: 2)",
+        "--data-bitrate", type=int, choices=range(len(DATA_BITRATES)), default=2, metavar="0-5",
+        help="CAN FD data bitrate index Y0-Y5: " + " ".join(DATA_BITRATES)
+        + " (default: 2; Y5 needs two boards that support it)",
     )
     parser.add_argument("--burst", type=int, default=1000, help="frames per burst stream (default: %(default)s)")
     parser.add_argument("--seed", type=int, default=random.randrange(1 << 32), help="random seed for IDs/data")
@@ -759,9 +770,16 @@ def main() -> int:
     errors = [e for e in (a.probe(), b.probe()) if e]
     if errors:
         for e in errors:
-            print(f"board not responding: {e}", file=sys.stderr)
+            print(f"board check failed: {e}", file=sys.stderr)
         print("Check that the board runs slcan_bridge, --baud matches the firmware "
               "(1000000), and no other program has the port open.", file=sys.stderr)
+        a.close()
+        b.close()
+        return 2
+    too_slow = [p.name for p in bench.ports if args.data_bitrate > p.max_data_bitrate]
+    if too_slow:
+        print(f"--data-bitrate {args.data_bitrate}: Y{args.data_bitrate} is not supported by board "
+              f"{' '.join(too_slow)}", file=sys.stderr)
         a.close()
         b.close()
         return 2
