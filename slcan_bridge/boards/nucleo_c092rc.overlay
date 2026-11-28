@@ -20,3 +20,14 @@
 &dmamux1 {
 	status = "okay";
 };
+
+/* CAN activity LEDs: LD1 (green, PA5) flashes on each sent frame, LD2 (blue,
+ * PC9) on each received frame. PA5 doubles as SPI1_SCK and TIM1_CH1 in the
+ * board DTS; neither driver is enabled, so the pin stays a GPIO.
+ */
+/ {
+	aliases {
+		can-tx-led = &green_led_1;
+		can-rx-led = &blue_led;
+	};
+};

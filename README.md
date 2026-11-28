@@ -13,7 +13,7 @@ The SLCAN bridge project enables communication between a host system and CAN net
 | Nucleo C092RC | `nucleo_c092rc` | `NC092`   | ST-LINK VCP, USART2 | On-board MCP2562FD                     | 48 MHz HSE  |
 | Nucleo H7S3L8 | `nucleo_h7s3l8` | `NH7S3`   | ST-LINK VCP, USART3 | External Adafruit CAN Pal (TJA1051T/3) | 60 MHz PLL2 |
 
-Both run the same firmware. Each board's differences are in `slcan_bridge/boards/<board>.overlay` (and `.conf`): the UART DMA channels and, on the H7S3L8, the external transceiver and the FDCAN clock. The H7S3L8 board files clock the FDCAN from the 24 MHz HSE; the overlay switches it to 60 MHz from PLL2 (VCO 600 MHz, P and Q divided by 10, R/S/T kept at 200 MHz), the lowest clock that every SLCAN bitrate divides. The Cortex-M7 of the H7S3L8 has a data cache, so `nucleo_h7s3l8.conf` enables `CONFIG_NOCACHE_MEMORY`, and the UART DMA buffers in `main.c` are marked `__nocache`. On the C092RC, which has no data cache, `__nocache` has no effect.
+Both run the same firmware. Each board's differences are in `slcan_bridge/boards/<board>.overlay` (and `.conf`): the UART DMA channels, the activity LEDs and, on the H7S3L8, the external transceiver and the FDCAN clock. The H7S3L8 board files clock the FDCAN from the 24 MHz HSE; the overlay switches it to 60 MHz from PLL2 (VCO 600 MHz, P and Q divided by 10, R/S/T kept at 200 MHz), the lowest clock that every SLCAN bitrate divides. The Cortex-M7 of the H7S3L8 has a data cache, so `nucleo_h7s3l8.conf` enables `CONFIG_NOCACHE_MEMORY`, and the UART DMA buffers in `main.c` are marked `__nocache`. On the C092RC, which has no data cache, `__nocache` has no effect.
 
 ### Wiring the Adafruit CAN Pal to the Nucleo H7S3L8
 
@@ -220,6 +220,17 @@ A channel opened with `L` sends no ACKs and no frames, but it receives. Receiver
 ### Command parsing
 
 Commands end with `\r`; a bare `\n` also ends a command, and the `\n` of a `\r\n` pair is ignored. A frame command must have exactly the length its DLC implies (no data for `r`/`R`), and its ID must fit 11 or 29 bits. A line longer than 256 characters gets one BEL, and the rest of it is discarded.
+
+### Activity LEDs
+
+Two user LEDs show bus traffic. The TX LED flashes when a frame has been sent (a node ACKed it); a frame that was queued but never ACKed does not flash it. The RX LED flashes for every frame received from the bus, including frames later dropped because the serial link was full (`F` bit 0).
+
+| Board         | TX LED          | RX LED           |
+| ------------- | --------------- | ---------------- |
+| Nucleo C092RC | LD1 green, PA5  | LD2 blue, PC9    |
+| Nucleo H7S3L8 | LD1 green, PD10 | LD2 yellow, PD13 |
+
+A frame lights its LED for 50 ms, after which the LED stays off for at least 50 ms. Continuous traffic therefore blinks the LED at 10 Hz instead of holding it on. The overlays pick the LEDs with the `can-tx-led` and `can-rx-led` aliases.
 
 ### Serial throughput
 

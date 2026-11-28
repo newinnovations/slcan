@@ -47,3 +47,13 @@
 	div-s = <3>;
 	div-t = <3>;
 };
+
+/* CAN activity LEDs: LD1 (green, PD10) flashes on each sent frame, LD2
+ * (yellow, PD13) on each received frame.
+ */
+/ {
+	aliases {
+		can-tx-led = &green_led;
+		can-rx-led = &yellow_led;
+	};
+};

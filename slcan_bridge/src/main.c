@@ -1,6 +1,7 @@
 #include <zephyr/kernel.h>
 #include <zephyr/device.h>
 #include <zephyr/drivers/can.h>
+#include <zephyr/drivers/gpio.h>
 #include <zephyr/drivers/uart.h>
 #include <zephyr/linker/section_tags.h>
 #include <zephyr/sys/ring_buffer.h>
@@ -18,6 +19,11 @@ static const struct device *const uart_dev = DEVICE_DT_GET(DT_CHOSEN(zephyr_cons
 #define SLCAN_SERIAL_NUMBER "NH7S3\r"
 #else
 #error "Unsupported board: add slcan_bridge/boards/<board>.overlay and a serial number"
+#endif
+
+/* Activity LEDs: the can-tx-led and can-rx-led aliases of the board overlay */
+#if !DT_NODE_EXISTS(DT_ALIAS(can_tx_led)) || !DT_NODE_EXISTS(DT_ALIAS(can_rx_led))
+#error "Board overlay must define the can-tx-led and can-rx-led aliases"
 #endif
 
 /* Ring buffers sized for 64-byte CAN FD ASCII bursts.
@@ -207,6 +213,62 @@ static bool parse_hex_u32(const char *str, size_t digits, uint32_t *out)
     return true;
 }
 
+/* ---------------- Activity LEDs ---------------- */
+
+/* A frame lights its LED for ACTIVITY_LED_ON_MS, after which the LED stays off
+ * for at least ACTIVITY_LED_OFF_MS: continuous traffic blinks it at 10 Hz
+ * instead of holding it on. Frames during either phase are not shown.
+ */
+#define ACTIVITY_LED_ON_MS  50
+#define ACTIVITY_LED_OFF_MS 50
+
+enum activity_led_phase {
+    ACTIVITY_LED_IDLE,
+    ACTIVITY_LED_ON,
+    ACTIVITY_LED_OFF,
+};
+
+struct activity_led {
+    struct gpio_dt_spec gpio;
+    struct k_timer timer;
+    atomic_t phase;
+};
+
+static struct activity_led tx_led = { .gpio = GPIO_DT_SPEC_GET(DT_ALIAS(can_tx_led), gpios) };
+static struct activity_led rx_led = { .gpio = GPIO_DT_SPEC_GET(DT_ALIAS(can_rx_led), gpios) };
+
+/* Timer expiry, ISR context */
+static void activity_led_expiry(struct k_timer *timer)
+{
+    struct activity_led *led = CONTAINER_OF(timer, struct activity_led, timer);
+
+    if (atomic_get(&led->phase) == ACTIVITY_LED_ON) {
+        gpio_pin_set_dt(&led->gpio, 0);
+        atomic_set(&led->phase, ACTIVITY_LED_OFF);
+        k_timer_start(&led->timer, K_MSEC(ACTIVITY_LED_OFF_MS), K_NO_WAIT);
+    } else {
+        atomic_set(&led->phase, ACTIVITY_LED_IDLE);
+    }
+}
+
+/* Called from the CAN callbacks (ISR context) */
+static void activity_led_flash(struct activity_led *led)
+{
+    if (atomic_cas(&led->phase, ACTIVITY_LED_IDLE, ACTIVITY_LED_ON)) {
+        gpio_pin_set_dt(&led->gpio, 1);
+        k_timer_start(&led->timer, K_MSEC(ACTIVITY_LED_ON_MS), K_NO_WAIT);
+    }
+}
+
+static int activity_led_init(struct activity_led *led)
+{
+    if (!gpio_is_ready_dt(&led->gpio)) {
+        return -ENODEV;
+    }
+    k_timer_init(&led->timer, activity_led_expiry, NULL);
+    return gpio_pin_configure_dt(&led->gpio, GPIO_OUTPUT_INACTIVE);
+}
+
 /* ---------------- CAN Callbacks ---------------- */
 
 static atomic_val_t can_state_flags(enum can_state state)
@@ -243,6 +305,8 @@ static void can_rx_cb(const struct device *dev, struct can_frame *frame, void *u
         .timestamp = (uint16_t)(k_uptime_get() % SLCAN_TIMESTAMP_WRAP_MS),
     };
 
+    activity_led_flash(&rx_led);
+
     if (k_msgq_put(&can_rx_msgq, &item, K_NO_WAIT) != 0) {
         atomic_or(&slcan_status, SLCAN_F_RX_QUEUE_FULL);
     }
@@ -255,6 +319,8 @@ static void can_tx_cb(const struct device *dev, int error, void *user_data)
 
     switch (error) {
     case 0:
+        activity_led_flash(&tx_led);
+        break;
     case -ENETDOWN: /* aborted by 'C' */
         break;
     case -EBUSY:
@@ -561,6 +627,11 @@ int main(void)
 
     if (uart_callback_set(uart_dev, uart_cb, NULL) != 0 ||
         uart_rx_enable(uart_dev, uart_rx_dma_buf, sizeof(uart_rx_dma_buf), 0) != 0) {
+        return -1;
+    }
+
+    /* Before the RX filters: their callbacks flash rx_led */
+    if (activity_led_init(&tx_led) != 0 || activity_led_init(&rx_led) != 0) {
         return -1;
     }
 
