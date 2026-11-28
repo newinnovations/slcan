@@ -19,11 +19,12 @@ The firmware sends nothing but SLCAN output on this port: boot banner, logging, 
 - Hex digits in arguments may be upper or lower case. The firmware always outputs upper-case hex.
 - Every command line gets exactly one response:
   - `\r` on success, or
+  - `z\r` or `Z\r` on success of a frame command (see [Transmit response](#transmit-response)), or
   - a value followed by `\r` for `V`, `N`, and `F`, or
   - a single `BEL` byte (`0x07`, written `\a`) on any error. No `CR` follows it.
 - An empty line (a bare `\r`) gets `\r`.
 - A line longer than 256 characters gets one `BEL` as soon as the 257th character arrives. The rest of the line, up to and including its terminator, is discarded without a further response.
-- Received CAN frames are pushed to the host whenever they arrive. They are never inserted inside another line, but they can arrive between a command and its response. Classify each line by its first byte: `t T r R d D b B` is a received frame, `V N F` is a value response, a bare `\r` is a success response, and `\a` is an error. Match responses to commands in the order the commands were sent.
+- Received CAN frames are pushed to the host whenever they arrive. They are never inserted inside another line, but they can arrive between a command and its response. Classify each line by its first byte: `t T r R d D b B` is a received frame, `z Z` is a transmit acknowledgment, `V N F` is a value response, a bare `\r` is a success response, and `\a` is an error. Match responses to commands in the order the commands were sent.
 - Commands can be sent back to back without waiting for each response. The serial receive buffer holds 1024 bytes. Command responses are never dropped: when the serial transmit buffer is full of received frames, the firmware waits for space before it answers and reads no further commands meanwhile. Keep the unanswered command bytes below 1024, or bytes are lost and `F` bit 3 is set.
 
 ### Line endings
@@ -90,7 +91,7 @@ The data-phase bit rate applies only to frames sent with bit-rate switching (`b`
 
 ### Listen-only mode
 
-A channel opened with `L` sends no ACKs and no frames, but receives everything on the bus. Transmit commands still get `\r`: the frame is queued in a transmit mailbox and stays there until `C`.
+A channel opened with `L` sends no ACKs and no frames, but receives everything on the bus. Transmit commands still get `z\r` or `Z\r`: the frame is queued in a transmit mailbox and stays there until `C`.
 
 Receivers ignore the ACK slot. When the listener is the only other node, nobody ACKs a frame, the sender retransmits it, and the listener reports every retransmission as a new frame until the sender closes its channel.
 
@@ -130,7 +131,7 @@ All frame commands require an open channel.
 
 ### Transmit response
 
-`\r` means the frame was placed in one of the controller's **3 transmit mailboxes**. It does not mean the frame was sent or acknowledged on the bus. There is no later completion message.
+As in LAWICEL, a frame command with an 11-bit identifier (`t`, `r`, `d`, `b`) gets `z\r` and one with a 29-bit identifier (`T`, `R`, `D`, `B`) gets `Z\r`. The reply means the frame was placed in one of the controller's **3 transmit mailboxes**. It does not mean the frame was sent or acknowledged on the bus. There is no later completion message.
 
 `BEL` means the frame was not queued, because:
 
@@ -182,7 +183,7 @@ The setting is kept in RAM only and resets to off. Send `Z1` after every reset.
 | Command | Required state | Success reply                                                                  |
 | ------- | -------------- | ------------------------------------------------------------------------------ |
 | `F\r`   | Open           | `F<flags>\r`, where `<flags>` is one status byte as two upper-case hex digits. |
-| `V\r`   | Any            | Always `V0102\r`: hardware field `01`, firmware field `02`.                    |
+| `V\r`   | Any            | Always `V0103\r`: hardware field `01`, firmware field `03`.                    |
 | `N\r`   | Any            | Always `NC092\r` on the C092RC, `NH7S3\r` on the H7S3L8.                       |
 
 `F` gets `BEL` while the channel is closed. `V` and `N` ignore any characters after the command letter.
@@ -214,7 +215,6 @@ The firmware aims to work with host software written for LAWICEL SLCAN adapters.
 
 | Area                    | LAWICEL SLCAN                                   | This firmware                                                                                                     | What can break                                                                                                                                                          |
 | ----------------------- | ----------------------------------------------- | ----------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Transmit acknowledgment | `z\r` for `t`/`r`, `Z\r` for `T`/`R`            | `\r` for every frame command                                                                                      | Hosts that wait for `z`/`Z` time out; hosts that count them to track queued frames miscount.                                                                            |
 | Custom bit timing       | `s<BTR0><BTR1>` sets SJA1000 registers          | `BEL`                                                                                                             | Hosts that use custom timing. If the host ignores the `BEL` and sends `O`, the channel opens at the previous bit rate without an error.                                 |
 | Acceptance filters      | `M` / `m` set hardware filters                  | `BEL`; every frame is forwarded                                                                                   | Hosts relying on hardware filtering get all bus traffic and must filter themselves; a busy bus can overflow the serial link (`F` bit 0).                                |
 | Open without bit rate   | `O` requires a prior `S` or `s`                 | `O` opens at the current rate, 500 kbit/s after reset                                                             | A host that forgets `S` gets no error and may join the bus at the wrong rate, disturbing it with error frames.                                                          |
@@ -225,7 +225,7 @@ The firmware aims to work with host software written for LAWICEL SLCAN adapters.
 | State errors            | Vary by adapter                                 | `C` while closed and `O`/`L`/`S`/`Y`/`Z` while open get `BEL`                                                     | Hosts that send `C` defensively before configuring get a `BEL`; harmless unless they treat it as fatal.                                                                 |
 | `F` availability        | Open channel                                    | Open channel only                                                                                                 | `F` sent before `O` gets `BEL`.                                                                                                                                         |
 | `F` bits                | Bit 3 controller data overrun, bit 7 bus error  | Bit 3 serial input overrun, bit 7 bus-off or transmit failure, bit 6 never set, bits 2/5/7 reflect the live state | Hosts that decode bits 3, 6, and 7 with the controller meanings misreport errors; hosts that expect a read to clear bits 2, 5, or 7 see them again.                     |
-| CAN FD                  | Not part of the protocol                        | `d`, `D`, `b`, `B`, `Y`, DLC `9`–`F`                                                                              | Classic-only hosts ignore received `d`/`D`/`b`/`B` lines, so they never see FD traffic.                                                                                 |
+| CAN FD                  | Not part of the protocol                        | `d`, `D`, `b`, `B`, `Y`, DLC `9`–`F`; `d`/`b` acknowledged with `z`, `D`/`B` with `Z`                             | Classic-only hosts ignore received `d`/`D`/`b`/`B` lines, so they never see FD traffic.                                                                                 |
 | Command parsing         | Varies                                          | Exact length; extra characters get `BEL`; lines over 256 characters get one `BEL`                                 | Hosts that append characters to frame commands or send data bytes with `r`/`R`.                                                                                         |
 | Line endings            | `\r`                                            | `\r`, `\n`, or `\r\n`; `\n\r` counts as two lines                                                                 | Hosts that send `\n\r` receive two responses per command.                                                                                                               |
 | Serial speed            | Adapter-specific, often 115,200 baud            | 1,000,000 baud fixed                                                                                              | Hosts that default to another speed see garbage or nothing.                                                                                                             |
@@ -249,4 +249,4 @@ Checked against the python-can `main` branch.
 - python-can sends `C` before configuring and `O` (or `L` with `listen_only=True`) afterwards without reading the responses. A rejected `S`, `Y`, or `s` therefore opens the channel at the previous bit rates without an error.
 - `send()` does not read responses. Frames rejected with `BEL` are lost silently.
 - Received timestamps are ignored; python-can stamps each message with the host time.
-- `get_version()` returns `(1, 2)`; `get_serial_number()` returns `"C092"` on the C092RC and `"H7S3"` on the H7S3L8.
+- `get_version()` returns `(1, 3)`; `get_serial_number()` returns `"C092"` on the C092RC and `"H7S3"` on the H7S3L8.
