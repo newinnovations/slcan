@@ -86,6 +86,11 @@ class Frame:
             p = "r" if self.rtr else "t"
         return p.upper() if self.ext else p
 
+    @property
+    def ack(self) -> str:
+        """Reply to a successful transmit command: 'z' for 11-bit, 'Z' for 29-bit IDs."""
+        return "Z" if self.ext else "z"
+
     def encode(self) -> str:
         can_id = f"{self.id:08X}" if self.ext else f"{self.id:03X}"
         return f"{self.prefix}{can_id}{self.dlc:X}{self.data.hex().upper()}"
@@ -221,10 +226,10 @@ class SlcanPort:
         retries = 0
         while True:
             got = self.command(frame.encode())
-            if got == "":
+            if got == frame.ack:
                 return retries
             if got != BEL or not retry:
-                raise TestFailure(f"{self.name}: {frame} answered {show(got)}, expected ACK")
+                raise TestFailure(f"{self.name}: {frame} answered {show(got)}, expected {show(frame.ack)}")
             if time.monotonic() > deadline:
                 raise TestFailure(f"{self.name}: TX mailboxes stayed full for {RESPONSE_TIMEOUT} s")
             retries += 1
@@ -409,7 +414,7 @@ def fd_frames(bench: Bench) -> None:
 def lowercase_hex(bench: Bench) -> None:
     """Lowercase hex digits in commands are accepted."""
     a, b = bench.ports
-    a.expect_ack("t7ff2abcd")
+    a.expect("t7ff2abcd", "z")
     expected = data_frame(0x7FF, b"\xab\xcd")
     got = b.receive()
     if got != expected:
@@ -424,7 +429,7 @@ def line_terminators(bench: Bench) -> None:
         frame = data_frame(0x123, bench.rng.randbytes(2))
         a.write(frame.encode() + terminator)
         got = a.response()
-        if got != "":
+        if got != frame.ack:
             raise TestFailure(f"{frame} + {terminator!r} answered {show(got)}")
         if (rx := b.receive()) != frame:
             raise TestFailure(f"sent {frame}, received {rx}")
@@ -671,10 +676,11 @@ def no_ack(bench: Bench) -> str:
     b.expect_ack("C")
     accepted = 0
     for i in range(10):
-        got = a.command(data_frame(0x123, bytes([i])).encode())
+        frame = data_frame(0x123, bytes([i]))
+        got = a.command(frame.encode())
         if got == BEL:
             break
-        if got != "":
+        if got != frame.ack:
             raise TestFailure(f"{a.name}: transmit answered {show(got)}")
         accepted += 1
     else:
@@ -702,7 +708,7 @@ def tx_order(bench: Bench) -> str:
         got = a.command(frame.encode())
         if got == BEL:
             break
-        if got != "":
+        if got != frame.ack:
             raise TestFailure(f"{a.name}: transmit answered {show(got)}")
         sent.append(frame)
     else:

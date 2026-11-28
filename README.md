@@ -145,8 +145,8 @@ PASS tx_order: 3 pending frames, IDs 700 600 500
 Two Nucleo H7S3L8 boards with CAN Pal transceivers, CAN FD data phase at 5 Mbit/s (`--data-bitrate 5`):
 
 ```text
-A=/dev/ttyACM0 B=/dev/ttyACM1 S6 (500k) Y5 (5M) seed=707410551
-PASS identification: A V0102 NH7S3, B V0102 NH7S3
+A=/dev/ttyACM0 B=/dev/ttyACM1 S6 (500k) Y2 (2M) seed=2388421241
+PASS identification: A V0103 NH7S3, B V0103 NH7S3
 PASS pipelined_commands
 PASS classic_standard
 PASS classic_extended
@@ -156,10 +156,10 @@ PASS lowercase_hex
 PASS line_terminators
 PASS rejected_commands
 PASS closed_channel
-PASS timestamps: board 203 ms vs host 200 ms
-PASS burst_classic: 1000 frames per stream in 0.97 s (1030 frames/s; A->B 0 BEL); 1000 frames per stream in 0.99 s (1005 frames/s; B->A 0 BEL)
-PASS burst_fd: 1000 frames per stream in 2.33 s (430 frames/s; A->B 0 BEL); 1000 frames per stream in 2.37 s (421 frames/s; B->A 0 BEL)
-PASS burst_bidirectional: 1000 frames per stream in 2.32 s (863 frames/s; A->B 0 BEL, B->A 0 BEL)
+PASS timestamps: board 206 ms vs host 200 ms
+PASS burst_classic: 1000 frames per stream in 1.03 s (975 frames/s; A->B 0 BEL); 1000 frames per stream in 1.05 s (953 frames/s; B->A 0 BEL)
+PASS burst_fd: 1000 frames per stream in 2.36 s (423 frames/s; A->B 0 BEL); 1000 frames per stream in 2.30 s (434 frames/s; B->A 0 BEL)
+PASS burst_bidirectional: 1000 frames per stream in 2.33 s (857 frames/s; A->B 0 BEL, B->A 0 BEL)
 PASS listen_only
 PASS no_ack: 3 frames queued before BEL, F22
 PASS tx_order: 3 pending frames, IDs 700 600 500
@@ -203,7 +203,7 @@ A host that streams commands without waiting for each ACK is no longer limited b
 
 ### Transmit acknowledgement
 
-`\r` after a transmit command means the frame was queued in a CAN TX mailbox, not that it was sent. A frame that no node ACKs is not reported as failed: the controller retransmits it until a node ACKs it or the channel is closed with `C`, and its transmit error counter rises until it is error passive (`F` bits 2 and 5). Meanwhile the mailboxes stay full, so later transmit commands are answered with BEL and set bit 1.
+A transmit command is answered with `z\r` for an 11-bit identifier (`t`, `r`, `d`, `b`) and `Z\r` for a 29-bit identifier (`T`, `R`, `D`, `B`), as in LAWICEL. The reply means the frame was queued in a CAN TX mailbox, not that it was sent. A frame that no node ACKs is not reported as failed: the controller retransmits it until a node ACKs it or the channel is closed with `C`, and its transmit error counter rises until it is error passive (`F` bits 2 and 5). Meanwhile the mailboxes stay full, so later transmit commands are answered with BEL and set bit 1.
 
 ### CAN FD
 
@@ -258,6 +258,7 @@ At 1 Mbaud the serial link carries about 100 kB/s. A busy bus produces more than
 16. The FDCAN TX mailboxes ran as a priority queue: pending frames left lowest ID first, and frames with the same ID in unpredictable order, which breaks protocols such as ISO-TP that rely on frame order. `CONFIG_CAN_MCAN_TX_FIFO` (Zephyr patch 0001) now sends them in the order the host queued them. The `tx_order` test queues descending IDs while no node ACKs and checks the receive order.
 17. Zephyr 4.4.2 zeroed the received frame once per interrupt, not per frame, so flags carried over when one interrupt read several frames: a standard frame after an extended one was reported as `T`, a classic frame after a CAN FD one as `d`/`b`. Zephyr patch 0002 backports the upstream fix.
 18. In Zephyr 4.4.2, when a frame's Tx event and a bus-off were handled in the same interrupt, the bus-off handler completed every Tx buffer first, and the Tx event handler then called the cleared, NULL, callback, crashing the firmware, and gave the TX semaphore a second time. Zephyr patch 0003 backports the upstream fix.
+19. Transmit commands were answered with a bare `\r`, so hosts written for LAWICEL that wait for `z`/`Z` timed out. Frame commands are now answered with `z\r` (11-bit ID) or `Z\r` (29-bit ID), CAN FD commands included; the firmware version reported by `V` is now `03`.
 
 ### Stack usage
 

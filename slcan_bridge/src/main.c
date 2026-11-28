@@ -390,11 +390,12 @@ static void handle_tx_frame(const char *cmd, size_t len,
     }
 
     /* Asynchronous: a synchronous send blocks forever if no node ACKs the frame.
-     * ACK means the frame was queued in a TX mailbox; the outcome is reported via 'F'.
+     * 'z'/'Z' (11-/29-bit ID, as in LAWICEL) means the frame was queued in a TX
+     * mailbox; the outcome is reported via 'F'.
      */
     int err = can_send(can_dev, &frame, K_NO_WAIT, can_tx_cb, NULL);
     if (err == 0) {
-        slcan_ack();
+        uart_send_str(is_ext ? "Z\r" : "z\r", 2);
     } else {
         if (err == -EAGAIN) {
             atomic_or(&slcan_status, SLCAN_F_TX_QUEUE_FULL);
@@ -512,7 +513,7 @@ static void process_slcan_command(const char *cmd, size_t len)
         break;
 
     case 'V': /* Hardware/Firmware version */
-        uart_send_str("V0102\r", 6);
+        uart_send_str("V0103\r", 6);
         break;
 
     case 'N': /* Serial number */
