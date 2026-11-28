@@ -1,0 +1,49 @@
+/* Bump ST-LINK VCP (USART3) to 1 Mbps to prevent serial bottlenecks.
+ *
+ * As on the C092RC, the UART runs on the async API: RX into a circular DMA
+ * buffer (GPDMA1 request 77 = USART3_RX, channel 2), TX by DMA (request 78 =
+ * USART3_TX, channel 3). Channels 0 and 1 are assigned to SAI1 in the SoC DTS.
+ * The Cortex-M7 D-cache requires the DMA buffers in uncached RAM
+ * (CONFIG_NOCACHE_MEMORY in nucleo_h7s3l8.conf).
+ */
+&usart3 {
+	current-speed = <1000000>;
+	dmas = <&gpdma1 3 78 STM32_DMA_PERIPH_TX>,
+	       <&gpdma1 2 77 (STM32_DMA_PERIPH_RX | STM32_DMA_MODE_CYCLIC |
+			      STM32_DMA_PRIORITY_VERY_HIGH)>;
+	dma-names = "tx", "rx";
+};
+
+/* The board has no CAN transceiver. An Adafruit CAN Pal (TJA1051T/3, rated
+ * 5 Mbit/s) is wired to FDCAN1: PD0 (RX, CN9 pin 25) and PD1 (TX, CN9 pin 27).
+ * Its SLNT pin stays open (internal pull-down: normal mode), so the
+ * transceiver is passive.
+ *
+ * The board DTS clocks FDCAN1 from the 24 MHz HSE, which 5 Mbit/s does not
+ * divide (4.8 time quanta). 60 MHz is the lowest clock that every data bitrate
+ * (0.5/1/2/3/4/5 Mbit/s) and nominal bitrate divides; the datasheet limit for
+ * the FDCAN kernel clock is 125 MHz.
+ */
+&fdcan1 {
+	clocks = <&rcc STM32_CLOCK(APB1_2, 8)>,
+		 <&rcc STM32_SRC_PLL2_Q FDCAN_SEL(2)>;
+
+	can-transceiver {
+		max-bitrate = <5000000>;
+	};
+};
+
+/* PLL2: 24 MHz / 8 = 3 MHz reference (2-4 MHz input range, wide VCO range),
+ * x 200 = 600 MHz VCO. FDCANSEL = 2 selects pll2_p_ck in the datasheet but
+ * PLL2Q in the HAL, so P and Q both give 60 MHz. R, S and T stay at 200 MHz,
+ * as in the board DTS.
+ */
+&pll2 {
+	div-m = <8>;
+	mul-n = <200>;
+	div-p = <10>;
+	div-q = <10>;
+	div-r = <3>;
+	div-s = <3>;
+	div-t = <3>;
+};

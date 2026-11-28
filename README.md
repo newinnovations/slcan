@@ -1,10 +1,37 @@
 # SLCAN Bridge
 
-This repository contains the Zephyr-based SLCAN bridge project for the Nucleo C092RC board.
+Zephyr-based SLCAN bridge for the Nucleo C092RC and Nucleo H7S3L8 boards.
 
 ## Overview
 
-The SLCAN bridge project enables communication between a host system and CAN networks using the Nucleo C092RC board. It implements the SLCAN protocol over UART and supports both Classic CAN and CAN FD frames. The bridge is built on the Zephyr RTOS, leveraging its device drivers and message queue mechanisms for efficient CAN frame handling.
+The SLCAN bridge project enables communication between a host system and CAN networks using a Nucleo board. It implements the SLCAN protocol over UART and supports both Classic CAN and CAN FD frames. The bridge is built on the Zephyr RTOS, leveraging its device drivers and message queue mechanisms for efficient CAN frame handling.
+
+## Supported boards
+
+| Board         | Zephyr board    | `N` reply | Host link           | CAN transceiver                        | FDCAN clock |
+| ------------- | --------------- | --------- | ------------------- | -------------------------------------- | ----------- |
+| Nucleo C092RC | `nucleo_c092rc` | `NC092`   | ST-LINK VCP, USART2 | On-board MCP2562FD                     | 48 MHz HSE  |
+| Nucleo H7S3L8 | `nucleo_h7s3l8` | `NH7S3`   | ST-LINK VCP, USART3 | External Adafruit CAN Pal (TJA1051T/3) | 60 MHz PLL2 |
+
+Both run the same firmware. Each board's differences are in `slcan_bridge/boards/<board>.overlay` (and `.conf`): the UART DMA channels and, on the H7S3L8, the external transceiver and the FDCAN clock. The H7S3L8 board files clock the FDCAN from the 24 MHz HSE; the overlay switches it to 60 MHz from PLL2 (VCO 600 MHz, P and Q divided by 10, R/S/T kept at 200 MHz), the lowest clock that every SLCAN bitrate divides. The Cortex-M7 of the H7S3L8 has a data cache, so `nucleo_h7s3l8.conf` enables `CONFIG_NOCACHE_MEMORY`, and the UART DMA buffers in `main.c` are marked `__nocache`. On the C092RC, which has no data cache, `__nocache` has no effect.
+
+### Wiring the Adafruit CAN Pal to the Nucleo H7S3L8
+
+The H7S3L8 has no CAN transceiver. Connect an [Adafruit CAN Pal](https://learn.adafruit.com/adafruit-can-pal/pinouts) to FDCAN1 on the Zio connectors:
+
+| CAN Pal | Nucleo H7S3L8                                            |
+| ------- | -------------------------------------------------------- |
+| Vcc     | 3V3, CN8 pin 7                                           |
+| GND     | GND, CN9 pin 23                                          |
+| TX      | PD1 (FDCAN1_TX), CN9 pin 27                              |
+| RX      | PD0 (FDCAN1_RX), CN9 pin 25                              |
+| SLNT    | Not connected (the TJA1051T/3 pulls it low: normal mode) |
+
+Power the CAN Pal from 3V3, not 5V: its RX output follows Vcc, and the MCU logic runs at 3.3 V. CAN H and CAN L go to the terminal block, and the **Termination** switch turns its 120 Ω on or off.
+
+## SLCAN Protocol
+
+Refer to the [slcan documentation](doc/slcan.md) for details on the supported SLCAN commands and protocol differences.
 
 ## Zephyr project setup
 
@@ -38,7 +65,7 @@ Files created in this repository directory:
 deps/zephyr/              Zephyr
 deps/modules/             Modules imported from Zephyr's manifest
 zephyr-sdk-<version>/     Zephyr SDK
-build/                    Build output of make.sh
+build/<board>/            Build output of make.sh
 ```
 
 Outside it, the SDK's `setup.sh` registers the SDK in the CMake user package registry under `~/.cmake/packages/Zephyr-sdk/`.
@@ -47,23 +74,24 @@ Outside it, the SDK's `setup.sh` registers the SDK in the CMake user package reg
 
 `zephyr/patches/zephyr/` holds local changes to Zephyr v4.4.2. `zephyr/patches.yml` lists them with their SHA-256 checksums; `west patch apply` refuses a patch whose checksum does not match.
 
-| Patch | Purpose |
-| ----- | ------- |
-| `0001-drivers-can-mcan-add-tx-fifo-mode.patch` | Adds `CONFIG_CAN_MCAN_TX_FIFO` (enabled in `prj.conf`), so the FDCAN sends frames in the order the host queued them. |
-| `0002-drivers-can-mcan-zero-out-rx-frame.patch` | Backport of upstream `1e1855620db4`: flags of a received frame no longer carry over to the next frame read in the same interrupt. |
-| `0003-drivers-can-mcan-ignore-tx-events-for-completed-tx-buffers.patch` | Backport of upstream `6cfafba540a8`: a frame completing while the controller goes bus-off no longer calls a NULL Tx callback. |
+| Patch                                                                   | Purpose                                                                                                                           |
+| ----------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------- |
+| `0001-drivers-can-mcan-add-tx-fifo-mode.patch`                          | Adds `CONFIG_CAN_MCAN_TX_FIFO` (enabled in `prj.conf`), so the FDCAN sends frames in the order the host queued them.              |
+| `0002-drivers-can-mcan-zero-out-rx-frame.patch`                         | Backport of upstream `1e1855620db4`: flags of a received frame no longer carry over to the next frame read in the same interrupt. |
+| `0003-drivers-can-mcan-ignore-tx-events-for-completed-tx-buffers.patch` | Backport of upstream `6cfafba540a8`: a frame completing while the controller goes bus-off no longer calls a NULL Tx callback.     |
 
 `west patch list` shows the patches, `west patch clean` reverts them (it runs `git checkout .` and `git clean -dfx` in `deps/zephyr`, discarding any other local change there), and `west patch apply` applies them again. To change a patch, edit Zephyr in `deps/zephyr`, write that change's diff (`git -C deps/zephyr diff`, without the other patches' hunks) to its patch file, and update the file's `sha256sum` in `zephyr/patches.yml`.
 
 ### Build
 
-To build the configured project after installation, run:
+To build after installation, run:
 
 ```sh
-./make.sh
+./make.sh                  # nucleo_c092rc, output in build/nucleo_c092rc
+./make.sh nucleo_h7s3l8    # output in build/nucleo_h7s3l8
 ```
 
-It sets `ZEPHYR_SDK_INSTALL_DIR` so the build prefers the SDK in this directory over any other registered one.
+It sets `ZEPHYR_SDK_INSTALL_DIR` so the build prefers the SDK in this directory over any other registered one. `./flash.sh [board]` flashes that build with STM32CubeProgrammer; the board defaults to `nucleo_c092rc` as well.
 
 ### Clean
 
@@ -75,7 +103,7 @@ To remove the generated local environment, workspace, build output, SDK, and the
 
 ### Test with two boards
 
-Flash both boards and wire their CAN connectors together (CANH-CANH, CANL-CANL, GND, terminated at both ends). Then run:
+Flash both boards and wire their CAN connectors together (CANH-CANH, CANL-CANL, GND, terminated at both ends). The boards can be of either type, for example a C092RC and an H7S3L8 with its CAN Pal. Then run:
 
 ```sh
 ./test-boards.py                     # board A /dev/ttyACM0, board B /dev/ttyACM1
@@ -83,9 +111,11 @@ Flash both boards and wire their CAN connectors together (CANH-CANH, CANL-CANL, 
 ./test-boards.py -k burst -v         # run tests matching "burst", log all serial traffic
 ```
 
-`uv` provides `pyserial`; `.venv/bin/python test-boards.py` works as well. Options set the ports (`--port-a`, `--port-b`), bitrates (`--bitrate 0-8`, `--data-bitrate 0-4`), burst length (`--burst`) and random seed (`--seed`). Before each test both channels are reopened at the chosen bitrates. The tests send Classic, extended, RTR and CAN FD frames (all DLCs, with and without BRS) both ways and compare them. They also check rejected commands, line endings, timestamps, sequenced bursts in each direction and both at once, listen-only mode, the TX mailboxes filling when no node ACKs, and that pending frames with descending IDs leave in the order sent. The exit code is 0 only if every test passes.
+`uv` provides `pyserial`; `.venv/bin/python test-boards.py` works as well. Options set the ports (`--port-a`, `--port-b`), bitrates (`--bitrate 0-8`, `--data-bitrate 0-5`), burst length (`--burst`) and random seed (`--seed`). `--data-bitrate 5` needs two H7S3L8 boards; the script reads each board's `N` reply and refuses a data bitrate a board does not support. Before each test both channels are reopened at the chosen bitrates. The tests send Classic, extended, RTR and CAN FD frames (all DLCs, with and without BRS) both ways and compare them. They also check rejected commands (including `Y5` on the C092RC), line endings, timestamps, sequenced bursts in each direction and both at once, listen-only mode, the TX mailboxes filling when no node ACKs, and that pending frames with descending IDs leave in the order sent. The exit code is 0 only if every test passes.
 
-Before the tests, the script sends `V` to each board. If a board does not answer, it reports whether any bytes arrived at all (none: board not running the firmware, wrong port, or the port held by another program; unterminated bytes: baud mismatch) and exits with code 2.
+Before the tests, the script sends `V` and `N` to each board. If a board does not answer, it reports whether any bytes arrived at all (none: board not running the firmware, wrong port, or the port held by another program; unterminated bytes: baud mismatch) and exits with code 2. It also exits with code 2 if a board's `N` reply is not a known board, or if `--data-bitrate` is higher than a board supports.
+
+Two Nucleo C092RC boards at the default bitrates:
 
 ![Test with two Nucleo C092RC boards connected via CAN](doc/two-boards.jpg "Test with two Nucleo C092RC boards connected via CAN")
 
@@ -112,6 +142,49 @@ PASS tx_order: 3 pending frames, IDs 700 600 500
 17/17 passed
 ```
 
+Two Nucleo H7S3L8 boards with CAN Pal transceivers, CAN FD data phase at 5 Mbit/s (`--data-bitrate 5`):
+
+```text
+A=/dev/ttyACM0 B=/dev/ttyACM1 S6 (500k) Y5 (5M) seed=707410551
+PASS identification: A V0102 NH7S3, B V0102 NH7S3
+PASS pipelined_commands
+PASS classic_standard
+PASS classic_extended
+PASS remote_frames
+PASS fd_frames
+PASS lowercase_hex
+PASS line_terminators
+PASS rejected_commands
+PASS closed_channel
+PASS timestamps: board 203 ms vs host 200 ms
+PASS burst_classic: 1000 frames per stream in 0.97 s (1030 frames/s; A->B 0 BEL); 1000 frames per stream in 0.99 s (1005 frames/s; B->A 0 BEL)
+PASS burst_fd: 1000 frames per stream in 2.33 s (430 frames/s; A->B 0 BEL); 1000 frames per stream in 2.37 s (421 frames/s; B->A 0 BEL)
+PASS burst_bidirectional: 1000 frames per stream in 2.32 s (863 frames/s; A->B 0 BEL, B->A 0 BEL)
+PASS listen_only
+PASS no_ack: 3 frames queued before BEL, F22
+PASS tx_order: 3 pending frames, IDs 700 600 500
+
+17/17 passed
+```
+
+This run confirms on hardware that FDCAN1 runs from the 60 MHz PLL2 clock and that 64-byte CAN FD frames with bitrate switching pass at 5 Mbit/s (`fd_frames`, `burst_fd`). It also confirms that the H7S3L8 accepts `Y5` (`closed_channel`), that the CAN Pal works with SLNT left open, and that the 1 Mbaud DMA UART with its buffers in uncached RAM keeps up through the STLINK-V3EC (`pipelined_commands`, bursts with no drops).
+
+#### Burst throughput
+
+The burst tests run in lockstep: the script writes one frame command and waits for its ACK before writing the next. No `BEL` occurred, so the TX mailboxes never filled and the CAN bus was never the bottleneck. A Classic 8-byte frame takes about 0.23 ms at 500 kbit/s, and a 64-byte CAN FD frame with BRS at 500 kbit/s / 5 Mbit/s under 0.25 ms. The frames/s figures therefore measure the round trip of one command between the host and the board.
+
+| Per frame                  | Command line   | UART time at 1 Mbaud | C092RC (ST-LINK/V2-1) | H7S3L8 (STLINK-V3EC) |
+| -------------------------- | -------------- | -------------------- | --------------------- | -------------------- |
+| Classic, 8 bytes           | 22 characters  | 0.22 ms              | 2.0 ms                | 0.98 ms              |
+| CAN FD, 64 bytes           | 134 characters | 1.34 ms              | 3.2 ms                | 2.35 ms              |
+| Round trip minus UART time |                |                      | about 1.8 ms          | about 0.8-1.0 ms     |
+
+On each board, the round trip minus the UART time is nearly the same for both frame sizes. It does not depend on the CAN data rate either (Y2 on the C092RC, Y5 on the H7S3L8): Classic frames have no data phase, and both rates are far faster than the serial link. The H7S3L8's faster CPU (200 MHz against 48 MHz) does not explain the difference, because parsing a command takes microseconds. The overhead most likely comes from the USB link of the ST-LINK. The ST-LINK/V2-1 is a USB full-speed device, polled in 1 ms frames, so a write and its reply take about two frames. The STLINK-V3EC is a USB high-speed device with 125 µs microframes.
+
+`burst_bidirectional` runs a Classic stream on one board and a CAN FD stream on the other in parallel. It ends when the slower CAN FD stream finishes (3.07 s and 2.32 s, about the time of `burst_fd` alone) and counts the frames of both streams, so its rate is about twice the CAN FD rate.
+
+A host that streams commands without waiting for each ACK is no longer limited by USB latency. It is then limited by the 1 Mbaud serial link (about 4,500 Classic or 740 CAN FD command lines per second) or by the CAN bus (about 4,300 Classic 8-byte frames per second at 500 kbit/s), whichever is slower. The test script does not measure this.
+
 ## Firmware behavior
 
 ### Status flags (`F`)
@@ -134,7 +207,7 @@ PASS tx_order: 3 pending frames, IDs 700 600 500
 
 ### CAN FD
 
-`O` and `L` always open the controller in CAN FD mode. Classic CAN frames are sent and received unchanged, and `d`/`D`/`b`/`B` work without a prior `Y`. The data phase defaults to 2 Mbit/s (nominal: 500 kbit/s); `Y0`-`Y4` change it while the channel is closed. `Y5` (5 Mbit/s) is answered with BEL: the FDCAN clock is the 48 MHz HSE, and 48 MHz / 5 Mbit/s = 9.6 time quanta per bit is not an integer. The on-board MCP2562FD transceiver is rated up to 5 Mbit/s.
+`O` and `L` always open the controller in CAN FD mode. Classic CAN frames are sent and received unchanged, and `d`/`D`/`b`/`B` work without a prior `Y`. The data phase defaults to 2 Mbit/s (nominal: 500 kbit/s); `Y0`-`Y5` change it while the channel is closed. `Y5` (5 Mbit/s) works only on the H7S3L8, whose 60 MHz FDCAN clock gives 12 time quanta per bit. The C092RC answers it with BEL: its FDCAN clock is the 48 MHz HSE, and 48 MHz / 5 Mbit/s = 9.6 time quanta per bit is not an integer. Both transceivers, the on-board MCP2562FD and the CAN Pal's TJA1051T/3, are rated up to 5 Mbit/s.
 
 ### Listen-only (`L`)
 
